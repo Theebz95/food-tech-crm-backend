@@ -1,4 +1,4 @@
-# Restaurant CRM Backend
+# Food Tech CRM Backend
 
 Django REST Framework backend for the restaurant CRM, extracted out of a
 Supabase-direct-from-frontend architecture. Deployed independently:
@@ -16,7 +16,7 @@ status" below for exactly what exists today.
 ## Local setup
 
 ```bash
-cd restaurant-crm-backend
+cd food-tech-crm-backend
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt

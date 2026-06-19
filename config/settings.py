@@ -1,5 +1,5 @@
 """
-Django settings for the Restaurant CRM backend.
+Django settings for the Food Tech CRM backend.
 
 Naming note: this module (config/settings.py) is unrelated to the `settings`
 Django *app* at the project root (settings/). The app is named after the old

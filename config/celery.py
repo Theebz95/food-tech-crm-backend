@@ -4,6 +4,6 @@ from celery import Celery
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
 
-app = Celery("restaurant_crm_backend")
+app = Celery("food_tech_crm_backend")
 app.config_from_object("django.conf:settings", namespace="CELERY")
 app.autodiscover_tasks()
