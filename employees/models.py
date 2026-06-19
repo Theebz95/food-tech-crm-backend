@@ -247,6 +247,10 @@ class LocationVerificationLog(models.Model):
     class Meta:
         ordering = ["-created_at"]
 
+    @property
+    def business(self):
+        return self.membership.business
+
     def __str__(self):
         return f"{self.check_type} check for {self.membership} ({'pass' if self.passed else 'fail'})"
 
