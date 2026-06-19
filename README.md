@@ -65,7 +65,8 @@ Copy the `whsec_...` it prints into `STRIPE_WEBHOOK_SECRET` in `.env`.
 | `finance` | **Partially built.** Stripe webhook endpoint (`webhooks.py`) and a stub `generate_due_recurring_transactions` task — both exist ahead of the domain models because they're new infrastructure / already wired into Celery Beat. No Finance models yet. |
 | `customers` | **Built.** `Customer`, `CustomerProfile`, `CustomerBusinessLink` models + DRF CRUD for `Customer` (`HasBusinessRole`-scoped) + server-side email/phone validation. See "Customers domain" below for the old-table mapping. |
 | `employees` | **Built.** Time tracking + geofencing, scheduling (recurring schedules expanded server-side via Celery Beat), shift swaps, time off, and pay stubs. See "Employees domain" below — including the pay stub tax disclaimer. |
-| `reservations`, `loyalty`, `inventory`, `documents`, `marketing`, `settings` | **Placeholders only.** Each `models.py` documents what's planned and which Phase 1 audit findings / Phase 2 architectural decisions it needs to address. No models, views, or URLs yet. |
+| `reservations` | **Built.** Tables, floor plans, business hours, blackout dates, reservation settings, reservations, and a waitlist — staff CRUD (`HasBusinessRole`) plus a separate, intentionally unauthenticated guest-booking flow. See "Reservations domain" below, including the guest-booking permission model. |
+| `loyalty`, `inventory`, `documents`, `marketing`, `settings` | **Placeholders only.** Each `models.py` documents what's planned and which Phase 1 audit findings / Phase 2 architectural decisions it needs to address. No models, views, or URLs yet. |
 
 ## The new tenancy model vs. the old one
 
@@ -132,8 +133,8 @@ Pulled directly from the Phase 1 SQL audit of the old `supabase/migrations`:
 
 | Old (Postgres trigger/function) | New (Django) | Status |
 |---|---|---|
-| `generate_confirmation_code()` / `set_confirmation_code` trigger | `Reservation.save()` override (or `pre_save` signal): generate only if empty, retry on collision since the field is unique | Documented in `reservations/models.py`; not implemented until that app is built |
-| `calculate_reservation_end_time()` / `set_reservation_end_time` trigger | Same `Reservation.save()` override: `end_time = start_time + timedelta(minutes=duration_minutes)` if not explicitly set | Documented in `reservations/models.py`; not implemented yet |
+| `generate_confirmation_code()` / `set_confirmation_code` trigger | `Reservation.save()` override: generates a 6-char uppercase hex code only if empty, retrying on collision (the original trigger never handled that — it just let the unique constraint raise) | **Built** (`reservations/models.py`) |
+| `calculate_reservation_end_time()` / `set_reservation_end_time` trigger | Same `Reservation.save()` override: `end_time = start_time + timedelta(minutes=duration_minutes)` if not explicitly set | **Built** (`reservations/models.py`) |
 | `is_superadmin(uuid)` / `has_role()` RPC | `User.is_superadmin` boolean + `IsSuperAdmin` DRF permission class | **Built** (`authentication/`) |
 | `sync_customer_to_portal_account()` / `sync_customer_to_portal` trigger (kept a linked portal account's name/phone in sync with the customer row) | **Moot** under unified auth — see "Customers domain" below for the full mapping | N/A |
 | Gift card balance, loyalty points accrual, invoice/payment status transitions | **No DB trigger existed for these even in the old system** — confirmed by grepping every migration; only the generic `updated_at` trigger touched those tables. All of that math was client-side. In this backend it becomes service-layer functions wrapped in `transaction.atomic()` + `select_for_update()` (see `loyalty/models.py`, `finance/models.py`) | Not implemented until those apps are built |
@@ -293,6 +294,129 @@ in that module's docstring.
 Generating a second pay stub for the same membership + period is rejected
 (`PayStubAlreadyExistsError`) rather than silently overwriting one.
 
+## Reservations domain
+
+Tables, floor plans, business hours, blackout dates, reservation settings,
+reservations, and a waitlist.
+
+| Old (Supabase) | New (Django) | Notes |
+|---|---|---|
+| `restaurant_tables` | `RestaurantTable` (`reservations/models.py`) | FK'd to `core.BusinessLocation` (required — see below). `position_x`/`position_y` are the only source of truth for where a table sits on the floor plan; nothing else stores position. |
+| `floor_plans` | `FloorPlan` | `layout` JSONField only ever references `RestaurantTable` ids + non-positional metadata (rotation/label) — never x/y. See the actual fix below. |
+| `business_hours` | `BusinessHours` | FK'd to `BusinessLocation`, one row per day-of-week. See the actual fix below for the enumeration issue this replaces. |
+| `blackout_dates` | `BlackoutDate` | FK'd to `BusinessLocation`. Blocks guest booking entirely for that date; checked by both the availability-slot calculation and the booking service. |
+| `reservation_settings` | `ReservationSetting` | `OneToOneField(Business)` — one row per business (booking window, buffer, max party size, slot interval, default duration), not per location. Auto-created with defaults on first staff read (`GET .../reservation-settings/`) rather than requiring a separate create step. |
+| `reservations` | `Reservation` | No `User` FK — see "Guest booking permission model" below. `table` is nullable until assigned. `end_time` and `confirmation_code` are always computed by `save()`, never client input. |
+| `waitlist` | `Waitlist` | FK'd to `BusinessLocation`. Converting an entry to a real `Reservation` (`reservations/services.py:convert_waitlist_entry`) goes through the same locked table-assignment path as a guest booking. |
+
+**Location scoping, a deliberate departure from `GeofenceSetting`:** every
+model above requires a `BusinessLocation` — there's no "business-wide"
+fallback the way `GeofenceSetting.location` is optional elsewhere in this
+codebase. A reservation is always "a table, at one specific location, at
+one specific time"; there's no sensible business-wide table or floor plan.
+A single-location restaurant simply creates exactly one `BusinessLocation`
+row to use this domain.
+
+### Guest booking permission model
+
+This is the one domain in this codebase where a request can be fully
+unauthenticated by design: a walk-up guest booking a table has no `User`
+row and no `BusinessMembership` — there's nothing for
+`core.permissions.HasBusinessRole` to check. Building a fake/shared "guest"
+user just to satisfy the membership model would be worse than having no
+auth at all (shared credentials, no real accountability), so the guest
+flow is a **separate set of views with a separate permission model**,
+not a relaxed version of `HasBusinessRole`:
+
+- **Staff-side** (`reservations/views.py`, mounted at `/api/businesses/<business_id>/...`):
+  ordinary `HasBusinessRole`-gated `ModelViewSet`s for tables, floor plans,
+  business hours, blackout dates, reservation settings, reservations
+  (+ `seat`/`cancel`/`no-show`/`complete` actions), and the waitlist
+  (+ `convert-to-reservation`). Same tenant-scoping pattern as every other
+  domain in this codebase.
+- **Guest-side** (`reservations/public_views.py`, mounted at a distinct
+  `/api/public/...` prefix in `config/urls.py` so it's unmistakable at the
+  routing level which endpoints require no auth): `authentication_classes = []`
+  + `permission_classes = [AllowAny]` on every view — the same reasoning as
+  `finance/webhooks.py`'s `StripeWebhookView` skipping `SupabaseAuthentication`
+  entirely, since a guest request carries no Supabase JWT to even attempt.
+  Covers: `GET .../availability/` (open slots for a date/party size),
+  `POST .../reservations/` (create a booking), `POST .../waitlist/` (join
+  directly), `GET .../business-hours/` (one location's hours), and
+  `GET /api/public/reservations/<confirmation_code>/` +
+  `.../cancel/` (exact-match lookup/cancel by the code the guest was given
+  — there is no list endpoint anywhere in this app, so a guest can't
+  enumerate anyone else's reservation).
+
+**Rate limiting is the primary abuse defense** for these endpoints, since
+there's no authenticated-user throttle bucket to fall back on. Each guest
+view has its own `ScopedRateThrottle` scope (`config/settings.py`
+`DEFAULT_THROTTLE_RATES`: `reservation_availability` 30/min,
+`reservation_booking` 5/min, `reservation_lookup` 5/min,
+`reservation_waitlist` 10/min, `reservation_business_hours` 30/min) rather
+than sharing the global `anon` bucket — so a burst against booking can't
+also exhaust the budget for the availability check, and vice versa.
+
+The confirmation-code lookup/cancel endpoints (`GuestReservationLookupView`,
+`GuestReservationCancelView`) get an extra layer on top, since they're the
+one place an attacker can profitably *guess* — a 6-char code is a ~16.7M
+keyspace. Both views share one `reservation_lookup` budget (so alternating
+GET/POST can't double the effective guess rate) **and** run a second,
+IP-independent `GlobalReservationLookupThrottle`
+(`reservations/throttles.py`, scope `reservation_lookup_global`, 20/min
+total across every client) on top of the per-IP cap — closing the gap
+where a guess attempt distributed across many IPs would otherwise stay
+under each individual IP's limit. See
+`reservations.tests.GuestReservationLookupThrottleTests` for both layers
+proven directly (an Nth request within the window gets a real 429, not
+just inferred from the throttle class being attached).
+
+`location`/`business` fields on every guest-facing serializer
+(`GuestReservationSerializer`, `GuestWaitlistSerializer`) are absent
+entirely, not just read-only — the view resolves `location` from the URL
+and passes it straight to the booking service, so a payload can't smuggle
+a different business's location id into a guest booking the way a
+read-only field could still theoretically be probed.
+
+### The actual fixes (Phase 1 audit findings)
+
+1. **Booking concurrency.** The old guest-reservation Edge Function had no
+   concurrency control at all — two guests hitting "book" for the same
+   table/slot simultaneously could both succeed. `reservations/services.py`
+   (`_assign_table_and_book`, used by both `book_reservation` and
+   `convert_waitlist_entry`) wraps candidate-table selection + `Reservation`
+   creation in `transaction.atomic()` + `select_for_update()` on the
+   `RestaurantTable` rows being considered — same pattern as
+   `employees/services.py:clock_in` locking the membership row. Proven by
+   a real multi-thread test (`reservations.tests.BookingConcurrencyTests`),
+   not just inferred from the locking call being present.
+
+2. **`business_hours` enumeration.** The old table was publicly readable in
+   a way that let anyone walk through business ids and read every
+   business's hours. The guest-facing read endpoint
+   (`GuestBusinessHoursView`) only ever resolves hours for the one
+   business + location named explicitly in both URL segments — there is no
+   route in this app, staff or guest, that lists `BusinessHours` across
+   locations or businesses.
+
+3. **Floor plan JSONB drift.** The old `floor_plans.layout` JSONB had no
+   schema validation and wasn't kept in sync with table position data, so
+   the two could silently drift apart. `FloorPlanSerializer` now validates
+   the JSON structure (every `tables[].table_id` must be a real
+   `RestaurantTable` for that location, and position keys — `x`/`y`/etc —
+   are rejected outright if present in a layout entry), and
+   `RestaurantTable.position_x`/`position_y` are the only place position
+   data is ever stored. There's nothing left to drift.
+
+4. **Confirmation code / end_time triggers.** Both were Postgres triggers
+   (`generate_confirmation_code()`/`set_confirmation_code`,
+   `calculate_reservation_end_time()`/`set_reservation_end_time`) — see
+   "Former Postgres triggers/functions" above. Now `Reservation.save()`
+   logic. The original trigger never handled a confirmation-code collision
+   (the unique constraint just raised); `save()` now retries with a fresh
+   code instead, proven by `reservations.tests.ConfirmationCodeCollisionTests`
+   forcing a collision via a mocked generator.
+
 ## Security hardening notes (for when each domain is built)
 
 These are commitments made now so they aren't lost by the time the
@@ -319,10 +443,13 @@ specific note:
 - **Public tracking beacon** (`marketing`): real server-side rate limiting
   keyed by IP + script_key (DRF scoped throttling or django-ratelimit), not
   the old client-side localStorage limiter.
-- **Guest reservation booking**: table assignment wrapped in
+- **Guest reservation booking**: **Built.** Table assignment wrapped in
   `transaction.atomic()` + `select_for_update()` on the candidate table
   rows for that date/slot, closing the double-booking race condition that
-  existed in the original Edge Function.
+  existed in the original Edge Function. See "Reservations domain" above,
+  including the guest-booking permission model (separate from
+  `HasBusinessRole`, rate-limiting as the primary abuse defense) and the
+  `business_hours`-enumeration and floor-plan-drift fixes.
 - **Stripe webhook**: signature-verified via `STRIPE_WEBHOOK_SECRET`
   (`finance/webhooks.py`), not authenticated via the normal JWT path since
   Stripe can't send one.

@@ -143,6 +143,24 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         "anon": "100/minute",
         "user": "1000/minute",
+        # Scoped throttles for the public, unauthenticated Reservations
+        # endpoints (reservations/public_views.py) — kept separate from the
+        # global "anon" bucket above so a burst against one of these
+        # doesn't also throttle every other anonymous endpoint in the API,
+        # and so booking abuse specifically gets a much tighter limit than
+        # read-only availability/hours checks. See README "Reservations
+        # domain" -> "Guest booking permission model".
+        "reservation_availability": "30/minute",
+        "reservation_booking": "5/minute",
+        # Guards a guessable 6-char confirmation code (~16.7M keyspace) —
+        # tighter than the other guest scopes on purpose. "_global" is a
+        # second, IP-independent cap (see reservations/throttles.py) so a
+        # guess attempt distributed across many IPs can't bypass the
+        # per-IP limit just by spreading out.
+        "reservation_lookup": "5/minute",
+        "reservation_lookup_global": "20/minute",
+        "reservation_waitlist": "10/minute",
+        "reservation_business_hours": "30/minute",
         # The marketing app's public tracking beacon will define its own,
         # stricter scoped throttle (keyed by IP + script_key) when that
         # domain is built — see README "Security hardening notes".
