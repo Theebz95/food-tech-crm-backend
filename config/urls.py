@@ -9,11 +9,14 @@ urlpatterns = [
     path("api/", include("reservations.urls")),
     path("api/", include("inventory.urls")),
     path("api/", include("documents.urls")),
-    # Public, unauthenticated guest-booking routes — deliberately mounted
-    # under a distinct prefix rather than alongside the HasBusinessRole
-    # routes above, so it's unmistakable at the routing level which
-    # endpoints require no auth. See reservations/public_views.py.
+    path("api/", include("marketing.urls")),
+    # Public, unauthenticated routes — deliberately mounted under a
+    # distinct prefix rather than alongside the HasBusinessRole routes
+    # above, so it's unmistakable at the routing level which endpoints
+    # require no auth. See reservations/public_views.py and
+    # marketing/public_views.py.
     path("api/public/", include("reservations.public_urls")),
+    path("api/public/", include("marketing.public_urls")),
     # Additional app urls.py files get wired in here as each domain is
     # built out in follow-up sessions.
 ]

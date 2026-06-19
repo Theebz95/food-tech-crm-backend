@@ -68,7 +68,8 @@ Copy the `whsec_...` it prints into `STRIPE_WEBHOOK_SECRET` in `.env`.
 | `reservations` | **Built.** Tables, floor plans, business hours, blackout dates, reservation settings, reservations, and a waitlist — staff CRUD (`HasBusinessRole`) plus a separate, intentionally unauthenticated guest-booking flow. See "Reservations domain" below, including the guest-booking permission model. |
 | `inventory` | **Built.** Vendors, inventory items, and an append-only transaction ledger — stock changes only ever happen through `adjust_stock()` (`transaction.atomic()` + `select_for_update()`), never a direct quantity write. See "Inventory domain" below. |
 | `documents` | **Built.** File metadata + Supabase Storage (S3-compatible) integration, fixing the old upload-orphan risk with a write-ahead `pending` row. See "Documents domain" below for the chosen strategy and why. |
-| `loyalty`, `marketing`, `settings` | **Placeholders only.** Each `models.py` documents what's planned and which Phase 1 audit findings / Phase 2 architectural decisions it needs to address. No models, views, or URLs yet. |
+| `marketing` | **Built.** Website tracking (scripts, visitors, page views, events), leads, form submissions, and Google Ads campaign metadata — a public, unauthenticated tracking beacon + form endpoint (server-side rate limited, payload-validated) alongside staff CRUD. See "Marketing domain" below, including the `script_key` threat model. |
+| `loyalty`, `settings` | **Placeholders only.** Each `models.py` documents what's planned and which Phase 1 audit findings / Phase 2 architectural decisions it needs to address. No models, views, or URLs yet. |
 
 ## The new tenancy model vs. the old one
 
@@ -531,6 +532,150 @@ streaming a potentially large file.
 - `GET /api/businesses/<business_id>/documents/<id>/download/` — presigned URL; 400 if the document isn't in `uploaded` status.
 - `DELETE /api/businesses/<business_id>/documents/<id>/` — goes through `services.delete_document` (storage then row), never generic `ModelViewSet.destroy()`.
 
+## Marketing domain
+
+Website tracking, leads, form submissions, and Google Ads campaign metadata.
+
+| Old (Supabase) | New (Django) | Notes |
+|---|---|---|
+| `tracking_scripts` (implicit/old Edge Function config) | `TrackingScript` (`marketing/models.py`) | FK'd to `Business`. `script_key` is generated server-side (`secrets.token_urlsafe(32)`) — never client-chosen, never sequential. One business can have more than one (e.g. separate marketing site vs. app subdomain). |
+| `website_visitors` / `analytics_sessions` | `WebsiteVisitor` | Anonymous, server-assigned identity — see "Guest-booking-style permission model" below. Carries `is_suspicious`/`flagged_at` for the abuse heuristic. |
+| `page_views` | `PageView` | FK'd to `WebsiteVisitor`. |
+| `tracking_events` | `TrackingEvent` | FK'd to `WebsiteVisitor`. `event_type` is one of a fixed set (`click`/`scroll`/`form_view`/`outbound_link`/`conversion`/`custom`), never an arbitrary client string. `metadata` is size-capped — see "Payload validation" below. |
+| `leads` | `Lead` | FK'd to `Business`. Basic UTM attribution fields + an optional FK to `GoogleAdsCampaign`. De-duped per business by email (mirrors `Customer`'s pattern), which is also what makes `services.submit_form`'s `get_or_create`-by-email safe. |
+| `form_submissions` | `FormSubmission` | FK'd to `Business` and optionally `Lead`. `ip_address` is stored but **never serialized by the API** — see "Form submissions" below. |
+| `google_ads_campaigns` | `GoogleAdsCampaign` | FK'd to `Business`. OAuth tokens encrypted at rest — see "OAuth token storage" below. |
+
+### The script_key threat model
+
+This is the one domain in this codebase where the public endpoints can't
+be protected by anything resembling an authorization check, by
+construction. The tracking beacon and form-submission endpoint are called
+from arbitrary visitor browsers on a business's own website — there is no
+`User`, no `BusinessMembership`, nothing to check. The only thing
+identifying the caller is `script_key`, embedded directly in the
+`<script>` tag's source on that website. **Anyone who views page source
+can read it.** Generating it more carefully (longer, more random, signed,
+whatever) does not change this — it is fundamentally visible, and
+therefore can never function as a secret. `script_key` answers "which
+business is this for," never "is this caller authorized."
+
+Given that, what actually defends `/api/public/track/` and
+`/api/public/forms/submit/`:
+
+1. **Server-side rate limiting, not the client-side kind.** The old
+   `useRateLimiter.ts` was a localStorage-based limiter — meaningless
+   against a real abuser, who simply doesn't run that JS and hits the
+   endpoint directly with `curl`/a script. Every limit here is enforced
+   server-side, in two independent dimensions (see "Rate limiting" below).
+2. **A uniform rejection for every way `script_key` resolution can fail.**
+   `services.resolve_script_key` returns `None` for a nonexistent key, an
+   inactive (revoked/rotated-away) key, and a malformed key alike, and
+   every caller of it (`public_views.py`) returns the exact same
+   `{"detail": "Invalid request."}` / 400 regardless of which. Without
+   this, an attacker could distinguish "doesn't exist" from "exists but
+   disabled" — confirming a guess is close, or that a business exists at
+   all — by tweaking inputs and watching the response change. Proven
+   directly: `marketing.tests.ScriptKeyRejectionTests` asserts all three
+   failure modes produce byte-identical responses. (Payload *shape*
+   errors — a missing field, wrong type — still get normal DRF field
+   errors; only `script_key` resolution gets the generic response, since
+   shape isn't secret but key validity is exactly the thing that must not
+   be probeable.)
+3. **Visitor identity is never client-supplied.** `WebsiteVisitor` rows are
+   identified by a server-set, `httponly` cookie (`ftc_vid`) — the public
+   endpoints never read a visitor id out of the request body at all. A
+   cookie value that doesn't resolve to a row for *this* business (wrong
+   business, tampered, garbage, or simply absent) is always treated as "no
+   visitor yet" rather than adopted as-is (`services.get_or_create_visitor`).
+   This closes off impersonating another visitor's history or smuggling
+   identity across businesses, by construction rather than validation.
+   **Known limitation, documented rather than hidden:** the tracking
+   domain (this API) differs from the business's own website domain, so
+   this cookie is third-party from the browser's perspective — modern
+   browsers' third-party-cookie restrictions (Safari ITP, Chrome's
+   phase-out) mean cross-session visitor continuity isn't fully reliable
+   in every browser. A more invasive fingerprinting approach would trade
+   that reliability gap for a privacy one; not attempted here.
+4. **Payload validation.** `event_type` is a fixed, validated set, not an
+   unbounded string. `metadata`/`form_data` are capped at 4KB/8KB
+   respectively (`marketing.serializers.MAX_METADATA_BYTES`/`MAX_FORM_DATA_BYTES`)
+   — an unvalidated JSONField on a public endpoint is an open invitation
+   to store arbitrarily large payloads.
+5. **A bot/abuse heuristic that flags, doesn't block.** If a single
+   `WebsiteVisitor` generates 20+ page views/events within 10 seconds
+   (`services.HIGH_FREQUENCY_WINDOW`/`HIGH_FREQUENCY_THRESHOLD`),
+   `is_suspicious`/`flagged_at` get set. This is a foundation — "this
+   traffic looks automated" surfaced to the business — not a full
+   bot-detection system; legitimate requests are never rejected because of
+   it.
+
+### Rate limiting
+
+Two independent dimensions on every public request, both server-side
+(`marketing/throttles.py`, rates in `config/settings.py` `DEFAULT_THROTTLE_RATES`):
+
+| Scope | Rate | Why |
+|---|---|---|
+| `track_event_ip` | 300/minute per caller IP | A real page load can fire several beacon calls (one pageview + a few interaction events), and many real visitors can legitimately share one corporate/NAT IP — generous enough not to false-positive on normal traffic, while still bounding a single-IP flood. |
+| `track_event_script_key` | 6000/minute (100/sec), per business, **independent of IP** | The actual circuit-breaker against volumetric abuse targeting one business. IP-independent on purpose — the same gap as `reservations.throttles.GlobalReservationLookupThrottle`: a burst distributed across many IPs would otherwise stay under each IP's individual cap while still hammering one `script_key`. Generous enough for a genuinely popular site with many concurrent visitors. |
+| `form_submit_ip` | 10/minute per caller IP | A real visitor rarely submits a form more than once or twice a minute. |
+| `form_submit_script_key` | 200/minute per business, independent of IP | Tighter than the event beacon on both axes — a form submission is consequential (creates a `Lead`); a flood of fake submissions pollutes lead data and costs staff time triaging it, where a flood of fake page views mostly just costs storage. |
+
+`marketing.tests.RateLimitingTests` proves both axes trip a real 429 (per-IP,
+per-script_key, and the distributed-burst-across-many-IPs case for both
+endpoints) — patching `THROTTLE_RATES` down per-test to make the threshold
+reachable quickly, rather than literally sending thousands of requests to
+exercise the production numbers above.
+
+### OAuth token storage
+
+`GoogleAdsCampaign.access_token`/`refresh_token` use `EncryptedTextField`
+(`marketing/encryption.py`) — Fernet (AES-128-CBC + HMAC, authenticated)
+encryption at rest, not a plain `CharField`. A raw DB dump, backup, or
+leaked connection string no longer hands over a directly usable OAuth
+token. Keyed by a dedicated `FIELD_ENCRYPTION_KEY` setting (`.env`) —
+deliberately not reusing `SECRET_KEY` or `SUPABASE_JWT_SECRET`, so
+rotating one doesn't entangle the other. Hand-rolled rather than pulling
+in `django-cryptography`/`django-fernet-fields`: it's one field on one
+model, and `cryptography` (already a dependency) is all it actually needs.
+
+Both token fields are also `write_only` on `GoogleAdsCampaignSerializer` —
+accepted on create/update, never returned by the API in any form,
+encrypted or decrypted. `marketing.tests.GoogleAdsCampaignEncryptionTests`
+proves the DB column itself isn't the plaintext (`SELECT access_token ...`
+via a raw cursor, compared against the value passed in) and that the API
+never serializes either field back out — not just that `EncryptedTextField`
+exists in the model definition.
+
+### Form submissions
+
+Stricter than the tracking beacon end-to-end (see rate limit table above)
+since each one is consequential: it becomes a `Lead`
+(`services.submit_form`, de-duplicated per business by email) rather than
+just a row in an analytics table. `FormSubmission.ip_address` is stored
+for abuse investigation only — `FormSubmissionSerializer` omits the field
+entirely (not even read-only), so there is no way to retrieve it through
+the API at all; it's visible only via Django admin or direct DB access.
+
+### Endpoints
+
+**Public, unauthenticated** (`authentication_classes = []`, same reasoning
+as `finance/webhooks.py`'s `StripeWebhookView` — there's no Supabase JWT
+to even attempt to verify):
+
+- `POST /api/public/track/` — `{"script_key", "kind": "pageview"|"event", ...}`.
+- `POST /api/public/forms/submit/` — `{"script_key", "form_data": {...}}`.
+
+**Staff-side** (`core.permissions.HasBusinessRole`, same tenant-scoping as
+every other domain):
+
+- `/api/businesses/<business_id>/tracking-scripts/` — CRUD; `script_key` is always server-generated (create and the `.../regenerate-key/` action), never client-chosen. Revoke via `is_active=False`; rotate via `.../regenerate-key/`.
+- `/api/businesses/<business_id>/website-visitors/`, `.../page-views/`, `.../tracking-events/` — read-only; these are system-managed, not staff-edited.
+- `/api/businesses/<business_id>/leads/` — CRUD.
+- `/api/businesses/<business_id>/form-submissions/` — read-only (`ip_address` never included — see above).
+- `/api/businesses/<business_id>/google-ads-campaigns/` — CRUD; `access_token`/`refresh_token` write-only.
+
 ## Security hardening notes (for when each domain is built)
 
 These are commitments made now so they aren't lost by the time the
@@ -564,9 +709,13 @@ specific note:
   deduction is an explicit placeholder, not compliant payroll tax logic.
   See the pay stub tax disclaimer in "Employees domain" above before this
   is used for anything beyond development/demo.
-- **Public tracking beacon** (`marketing`): real server-side rate limiting
-  keyed by IP + script_key (DRF scoped throttling or django-ratelimit), not
-  the old client-side localStorage limiter.
+- **Public tracking beacon / form submission** (`marketing`): **Built.**
+  Real server-side rate limiting, two independent dimensions (per-IP and
+  per-`script_key`, the latter IP-independent), not the old client-side
+  localStorage limiter. `script_key` is treated as identifying *which
+  business*, never *who's authorized*, since it's visible in client-side
+  JS source by necessity. See "Marketing domain" above for the full
+  threat model and the chosen rate numbers.
 - **Guest reservation booking**: **Built.** Table assignment wrapped in
   `transaction.atomic()` + `select_for_update()` on the candidate table
   rows for that date/slot, closing the double-booking race condition that

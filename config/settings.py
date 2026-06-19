@@ -36,6 +36,12 @@ def env_list(key, default=""):
 
 
 SECRET_KEY = env("DJANGO_SECRET_KEY", "insecure-dev-key-change-me")
+
+# --- Field-level encryption (marketing/encryption.py) -----------------------
+# A dedicated key for encrypting stored OAuth tokens at rest — deliberately
+# separate from SECRET_KEY so rotating one doesn't entangle the other.
+# Generate a real one with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+FIELD_ENCRYPTION_KEY = env("FIELD_ENCRYPTION_KEY", "o6OYrFFE6dCmML-Nxq4x7fzCNVM9C0_EPGTtqoiKT-o=")
 DEBUG = env_bool("DJANGO_DEBUG", True)
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
 
@@ -161,9 +167,20 @@ REST_FRAMEWORK = {
         "reservation_lookup_global": "20/minute",
         "reservation_waitlist": "10/minute",
         "reservation_business_hours": "30/minute",
-        # The marketing app's public tracking beacon will define its own,
-        # stricter scoped throttle (keyed by IP + script_key) when that
-        # domain is built — see README "Security hardening notes".
+        # Marketing tracking beacon / form submission — see README
+        # "Marketing domain" for the full reasoning. "_ip" is per caller
+        # IP (ScopedRateThrottle); "_script_key" is per business, IP-independent
+        # (marketing/throttles.py) — a real page load can fire several
+        # beacon calls, and many real visitors can share one corporate/NAT
+        # IP, so the per-IP rate is generous; the per-script_key rate is
+        # the actual circuit-breaker against volumetric abuse targeting
+        # one business. Forms are tighter than events on both axes since
+        # a submission is consequential (creates a Lead) where a flood of
+        # fake page views mostly just costs storage.
+        "track_event_ip": "300/minute",
+        "track_event_script_key": "6000/minute",
+        "form_submit_ip": "10/minute",
+        "form_submit_script_key": "200/minute",
     },
 }
 
