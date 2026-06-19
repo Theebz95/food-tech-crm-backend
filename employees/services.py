@@ -1,18 +1,22 @@
 """
-Service-layer functions for time tracking + geofencing.
+Service-layer state-machine functions: time tracking + geofencing, shift
+swap approval, and time-off approval. (Recurring schedule expansion lives
+in scheduling.py/tasks.py; pay stub calculation lives in payroll.py —
+split out since they're a different kind of operation, not a request/response
+state transition.)
 
-This is the one place distance/within-geofence verdicts are computed.
-Views never accept a distance or a "within range" boolean from the client —
-only raw lat/lng — and pass them through `verify_geofence` here. This is
-the direct fix for the Phase 1 audit finding that the old frontend computed
-and trusted this entirely client-side (src/lib/geolocation.ts).
+Time tracking: this is the one place distance/within-geofence verdicts are
+computed. Views never accept a distance or a "within range" boolean from
+the client — only raw lat/lng — and pass them through `verify_geofence`
+here. This is the direct fix for the Phase 1 audit finding that the old
+frontend computed and trusted this entirely client-side
+(src/lib/geolocation.ts).
 
-State-transition functions (`clock_in`, `clock_out`, `start_break`,
-`end_break`) are the only way TimeEntry/TimeEntryBreak rows get created or
-closed — there is no generic create/update exposed via the API (see
-views.py) — so the state machine invariants enforced here (no double
-clock-in, no clock-out without an open entry, etc.) can't be bypassed by
-hitting a CRUD endpoint directly.
+Every function here is the only way its respective rows get created,
+closed, or change status — there is no generic create/update exposed via
+the API (see views.py) — so the state machine invariants enforced here (no
+double clock-in, no approving a non-pending request, etc.) can't be
+bypassed by hitting a CRUD endpoint directly.
 """
 
 import math
@@ -25,7 +29,15 @@ from django.utils import timezone
 
 from core.models import BusinessMembership
 
-from .models import GeofenceSetting, LocationVerificationLog, TimeEntry, TimeEntryBreak
+from .models import (
+    EmployeeShift,
+    GeofenceSetting,
+    LocationVerificationLog,
+    ShiftSwapRequest,
+    TimeEntry,
+    TimeEntryBreak,
+    TimeOffRequest,
+)
 
 EARTH_RADIUS_METERS = 6_371_000
 
@@ -247,3 +259,90 @@ def end_break(membership: BusinessMembership) -> TimeEntryBreak:
         open_break.break_end_at = timezone.now()
         open_break.save(update_fields=["break_end_at", "updated_at"])
         return open_break
+
+
+class ShiftSwapError(Exception):
+    pass
+
+
+class TimeOffError(Exception):
+    pass
+
+
+def request_shift_swap(shift: EmployeeShift, requesting_membership: BusinessMembership, target_membership=None):
+    if shift.membership_id != requesting_membership.id:
+        raise ShiftSwapError("Can only request a swap for your own shift.")
+    if target_membership is not None and target_membership.business_id != requesting_membership.business_id:
+        raise ShiftSwapError("Target membership must belong to the same business.")
+    if ShiftSwapRequest.objects.filter(shift=shift, status=ShiftSwapRequest.Status.PENDING).exists():
+        raise ShiftSwapError("A swap request is already pending for this shift.")
+
+    return ShiftSwapRequest.objects.create(
+        shift=shift, requesting_membership=requesting_membership, target_membership=target_membership
+    )
+
+
+def approve_shift_swap(
+    swap_request: ShiftSwapRequest, approving_membership: BusinessMembership, target_membership=None
+) -> ShiftSwapRequest:
+    """
+    `target_membership` lets a manager resolve an open request (one with no
+    target_membership set yet) at approval time; if the request already has
+    one, this is optional and must match if provided.
+    """
+    with transaction.atomic():
+        locked = ShiftSwapRequest.objects.select_for_update().get(pk=swap_request.pk)
+        if locked.status != ShiftSwapRequest.Status.PENDING:
+            raise ShiftSwapError("Swap request is not pending.")
+
+        final_target = target_membership or locked.target_membership
+        if final_target is None:
+            raise ShiftSwapError("No target membership to assign this shift to.")
+        if final_target.business_id != locked.requesting_membership.business_id:
+            raise ShiftSwapError("Target membership must belong to the same business.")
+
+        shift = EmployeeShift.objects.select_for_update().get(pk=locked.shift_id)
+        shift.membership = final_target
+        shift.save(update_fields=["membership", "updated_at"])
+
+        locked.status = ShiftSwapRequest.Status.APPROVED
+        locked.target_membership = final_target
+        locked.approved_by = approving_membership
+        locked.save(update_fields=["status", "target_membership", "approved_by", "updated_at"])
+        return locked
+
+
+def reject_shift_swap(swap_request: ShiftSwapRequest, approving_membership: BusinessMembership) -> ShiftSwapRequest:
+    with transaction.atomic():
+        locked = ShiftSwapRequest.objects.select_for_update().get(pk=swap_request.pk)
+        if locked.status != ShiftSwapRequest.Status.PENDING:
+            raise ShiftSwapError("Swap request is not pending.")
+
+        locked.status = ShiftSwapRequest.Status.REJECTED
+        locked.approved_by = approving_membership
+        locked.save(update_fields=["status", "approved_by", "updated_at"])
+        return locked
+
+
+def approve_time_off(time_off_request: TimeOffRequest, approving_membership: BusinessMembership) -> TimeOffRequest:
+    with transaction.atomic():
+        locked = TimeOffRequest.objects.select_for_update().get(pk=time_off_request.pk)
+        if locked.status != TimeOffRequest.Status.PENDING:
+            raise TimeOffError("Time off request is not pending.")
+
+        locked.status = TimeOffRequest.Status.APPROVED
+        locked.approved_by = approving_membership
+        locked.save(update_fields=["status", "approved_by", "updated_at"])
+        return locked
+
+
+def reject_time_off(time_off_request: TimeOffRequest, approving_membership: BusinessMembership) -> TimeOffRequest:
+    with transaction.atomic():
+        locked = TimeOffRequest.objects.select_for_update().get(pk=time_off_request.pk)
+        if locked.status != TimeOffRequest.Status.PENDING:
+            raise TimeOffError("Time off request is not pending.")
+
+        locked.status = TimeOffRequest.Status.REJECTED
+        locked.approved_by = approving_membership
+        locked.save(update_fields=["status", "approved_by", "updated_at"])
+        return locked

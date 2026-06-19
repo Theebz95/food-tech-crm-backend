@@ -183,4 +183,10 @@ CELERY_BEAT_SCHEDULE = {
         "task": "finance.tasks.generate_due_recurring_transactions",
         "schedule": crontab(hour=1, minute=0),
     },
+    # Replaces the old client-side, render-time recurring schedule
+    # expansion — see employees/models.py module docstring "Security fix #2".
+    "expand-recurring-schedules": {
+        "task": "employees.tasks.expand_recurring_schedules",
+        "schedule": crontab(hour=2, minute=0),
+    },
 }

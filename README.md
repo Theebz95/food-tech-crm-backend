@@ -64,7 +64,7 @@ Copy the `whsec_...` it prints into `STRIPE_WEBHOOK_SECRET` in `.env`.
 | `authentication` | **Built.** Custom `User` model (Supabase-id-keyed), `SupabaseAuthentication` DRF auth class, `IsSuperAdmin` permission class. |
 | `finance` | **Partially built.** Stripe webhook endpoint (`webhooks.py`) and a stub `generate_due_recurring_transactions` task — both exist ahead of the domain models because they're new infrastructure / already wired into Celery Beat. No Finance models yet. |
 | `customers` | **Built.** `Customer`, `CustomerProfile`, `CustomerBusinessLink` models + DRF CRUD for `Customer` (`HasBusinessRole`-scoped) + server-side email/phone validation. See "Customers domain" below for the old-table mapping. |
-| `employees` | **Partially built.** Time tracking + server-side geofence verification only (`GeofenceSetting`, `TimeEntry`, `TimeEntryBreak`, `LocationVerificationLog`). Scheduling/shifts and pay stubs are not built yet. See "Employees & Time Tracking domain" below. |
+| `employees` | **Built.** Time tracking + geofencing, scheduling (recurring schedules expanded server-side via Celery Beat), shift swaps, time off, and pay stubs. See "Employees domain" below — including the pay stub tax disclaimer. |
 | `reservations`, `loyalty`, `inventory`, `documents`, `marketing`, `settings` | **Placeholders only.** Each `models.py` documents what's planned and which Phase 1 audit findings / Phase 2 architectural decisions it needs to address. No models, views, or URLs yet. |
 
 ## The new tenancy model vs. the old one
@@ -163,15 +163,16 @@ format and phone format (`^\+?[0-9]{7,15}$`) are validated server-side in
 `customers/serializers.py`, per the Phase 1 audit finding that this used to
 be client-side only and trivially bypassed by calling the API directly.
 
-## Employees & Time Tracking domain
+## Employees domain
 
 There is no separate Employee-as-user model. An "employee" is a
 `core.BusinessMembership` with role `staff` or `manager`; every model below
-FKs to `BusinessMembership`, which already identifies both the person
-(`.user`) and which `Business`/`BusinessLocation` they belong to.
+FKs to `BusinessMembership` (directly, or transitively via `EmployeeShift`),
+which already identifies both the person (`.user`) and which
+`Business`/`BusinessLocation` they belong to.
 
-This pass covers time tracking + geofencing only. Scheduling/shifts and pay
-stub calculation are deferred to a follow-up session.
+Covers time tracking + geofencing, scheduling (recurring schedules, shifts,
+swaps, time off), and pay stubs.
 
 | Old (Supabase) | New (Django) | Notes |
 |---|---|---|
@@ -225,6 +226,73 @@ These are explicit state-transition actions, not generic CRUD — `TimeEntry`
 and `TimeEntryBreak` have no create/update/delete endpoint at all, only the
 service-layer functions in `employees/services.py` can mutate them.
 
+### Scheduling: positions, shifts, swaps, time off
+
+| Old (Supabase) | New (Django) | Notes |
+|---|---|---|
+| `positions` | `Position` | FK'd to `Business`. Carries `hourly_rate` — see the design-choice note in `employees/models.py` for why the rate lives here rather than on `BusinessMembership`. |
+| *(no old equivalent)* | `EmployeeAvailability` | New. General weekly availability (day-of-week + time range) per `BusinessMembership`. Not yet matched automatically against schedules. |
+| `shift_templates` | `ShiftTemplate` | Reusable shift definition (position, day-of-week, start/end time). One row per day-of-week, same convention as `EmployeeAvailability`. |
+| `recurring_schedules` | `RecurringSchedule` | The durable rule ("this membership works this template, weekly"). Always references a `ShiftTemplate`. |
+| `employee_shifts` | `EmployeeShift` | **The actual security/data-integrity fix below.** FK'd to `BusinessMembership` + `Position`, with a nullable FK back to the `RecurringSchedule` that generated it (null for one-off manually created shifts). |
+| `shift_swap_requests` | `ShiftSwapRequest` | Give-away/reassign model, not a true two-way trade (matches what the old schema actually supported — one `shift`, optional `target_membership`). |
+| `time_off_requests` | `TimeOffRequest` | Standard request/approve/reject, FK'd to `BusinessMembership`. |
+
+**The actual fix:** recurring schedules used to be expanded into visible
+shifts entirely client-side, on every render (`useRecurringSchedules`-style
+logic in the old frontend) — there was never a durable row for "this
+employee works next Tuesday" until a browser happened to compute it from
+the rule. `employees/scheduling.py` (`expand_active_recurring_schedules`,
+run daily by Celery Beat — see `CELERY_BEAT_SCHEDULE` in
+`config/settings.py`) now creates real, persisted `EmployeeShift` rows on a
+rolling 4-week-ahead basis. It's idempotent: a DB-level partial unique
+constraint on `(recurring_schedule, start_at)`
+(`EmployeeShift.Meta.constraints`) backs up the `get_or_create()` call, so
+re-running the task — including two overlapping Beat runs — never
+duplicates shifts.
+
+**Endpoints** (manager+ required for everything except an employee's own
+availability/swap-request/time-off-request creation; see
+`employees/views.py` for the exact per-action permission split):
+
+- `/api/businesses/<business_id>/positions/`, `/shift-templates/`, `/recurring-schedules/` — manager+ CRUD.
+- `/api/businesses/<business_id>/availabilities/` — any business member, scoped to their own rows (managers can see everyone's).
+- `/api/businesses/<business_id>/shifts/` — visible to the whole team; create/update/delete and `.../<id>/set-status/` are manager+ only.
+- `/api/businesses/<business_id>/shift-swap-requests/` — any member can request a swap on their own shift; `.../<id>/approve/` and `.../reject/` are manager+ only. An open request (no `target_membership`) can be resolved at approval time via `{"target_membership_id": ...}`.
+- `/api/businesses/<business_id>/time-off-requests/` — any member can request their own; `.../<id>/approve/` and `.../reject/` are manager+ only.
+
+### Pay stubs
+
+| Old (Supabase) | New (Django) | Notes |
+|---|---|---|
+| `pay_stubs` | `PayStub` | FK'd to `BusinessMembership` and the `Position` whose `hourly_rate` was used. `breakdown` (JSONField) stores the full per-week regular/overtime/tax math, not just the final numbers. |
+
+**The actual fix:** gross/net pay used to be computed client-side
+(`PayStubs.tsx`) with no overtime or tax logic and no validation at all.
+`employees/payroll.py` (`generate_pay_stub`) computes it server-side, pulling
+real worked hours from `TimeEntry` (clock_out − clock_in, minus any closed
+breaks) — never manual entry. Overtime is split per ISO week against a
+threshold read from `Business.extra_settings["overtime_threshold_hours"]`
+(default 40), since "40 hrs/week" only makes sense applied week-by-week
+even across a biweekly pay period.
+
+**⚠️ Pay stub tax disclaimer:** the tax deduction in `employees/payroll.py`
+(`PLACEHOLDER_FLAT_TAX_RATE`) is a single flat percentage of gross pay. It
+has **no concept of tax brackets, filing status, jurisdiction, FICA/social
+security, or any other real payroll tax rule.** It exists only so `PayStub`
+has a structurally complete `net_pay` for development/demo purposes. **Do
+not use this for real payroll** without replacing it with real,
+jurisdiction-correct tax logic (ideally via a payroll tax provider/API) and
+getting accountant/legal sign-off first. This is called out again, loudly,
+in that module's docstring.
+
+**Endpoint:** `GET /api/businesses/<business_id>/pay-stubs/` and
+`.../<id>/` — staff see only their own, manager+ see everyone's.
+`POST .../pay-stubs/generate/` (manager+ only) —
+`{"membership_id": ..., "position_id": ..., "pay_period_start": ..., "pay_period_end": ...}`.
+Generating a second pay stub for the same membership + period is rejected
+(`PayStubAlreadyExistsError`) rather than silently overwriting one.
+
 ## Security hardening notes (for when each domain is built)
 
 These are commitments made now so they aren't lost by the time the
@@ -236,10 +304,18 @@ specific note:
   No client-trusted balance math.
 - **Employee geofencing**: **Built.** Server computes the Haversine distance
   from submitted GPS coordinates server-side; never trusts a client-sent
-  "within range" boolean. See "Employees & Time Tracking domain" above.
+  "within range" boolean. See "Employees domain" above.
 - **Clock-in/out**: **Built.** A real server-side state machine (no
   clock-out without an open clock-in, no double clock-in), backed by
   `select_for_update()` + a DB-level unique constraint.
+- **Recurring schedule expansion**: **Built.** Persisted into real
+  `EmployeeShift` rows by a daily, idempotent Celery Beat task instead of
+  being computed client-side on every render. See "Employees domain" above.
+- **Pay stub calculation**: **Built**, with a deliberate caveat — gross/net
+  pay is computed server-side from real `TimeEntry` hours, but the tax
+  deduction is an explicit placeholder, not compliant payroll tax logic.
+  See the pay stub tax disclaimer in "Employees domain" above before this
+  is used for anything beyond development/demo.
 - **Public tracking beacon** (`marketing`): real server-side rate limiting
   keyed by IP + script_key (DRF scoped throttling or django-ratelimit), not
   the old client-side localStorage limiter.
