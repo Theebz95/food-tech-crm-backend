@@ -64,7 +64,8 @@ Copy the `whsec_...` it prints into `STRIPE_WEBHOOK_SECRET` in `.env`.
 | `authentication` | **Built.** Custom `User` model (Supabase-id-keyed), `SupabaseAuthentication` DRF auth class, `IsSuperAdmin` permission class. |
 | `finance` | **Partially built.** Stripe webhook endpoint (`webhooks.py`) and a stub `generate_due_recurring_transactions` task — both exist ahead of the domain models because they're new infrastructure / already wired into Celery Beat. No Finance models yet. |
 | `customers` | **Built.** `Customer`, `CustomerProfile`, `CustomerBusinessLink` models + DRF CRUD for `Customer` (`HasBusinessRole`-scoped) + server-side email/phone validation. See "Customers domain" below for the old-table mapping. |
-| `reservations`, `loyalty`, `employees`, `inventory`, `documents`, `marketing`, `settings` | **Placeholders only.** Each `models.py` documents what's planned and which Phase 1 audit findings / Phase 2 architectural decisions it needs to address. No models, views, or URLs yet. |
+| `employees` | **Partially built.** Time tracking + server-side geofence verification only (`GeofenceSetting`, `TimeEntry`, `TimeEntryBreak`, `LocationVerificationLog`). Scheduling/shifts and pay stubs are not built yet. See "Employees & Time Tracking domain" below. |
+| `reservations`, `loyalty`, `inventory`, `documents`, `marketing`, `settings` | **Placeholders only.** Each `models.py` documents what's planned and which Phase 1 audit findings / Phase 2 architectural decisions it needs to address. No models, views, or URLs yet. |
 
 ## The new tenancy model vs. the old one
 
@@ -162,6 +163,68 @@ format and phone format (`^\+?[0-9]{7,15}$`) are validated server-side in
 `customers/serializers.py`, per the Phase 1 audit finding that this used to
 be client-side only and trivially bypassed by calling the API directly.
 
+## Employees & Time Tracking domain
+
+There is no separate Employee-as-user model. An "employee" is a
+`core.BusinessMembership` with role `staff` or `manager`; every model below
+FKs to `BusinessMembership`, which already identifies both the person
+(`.user`) and which `Business`/`BusinessLocation` they belong to.
+
+This pass covers time tracking + geofencing only. Scheduling/shifts and pay
+stub calculation are deferred to a follow-up session.
+
+| Old (Supabase) | New (Django) | Notes |
+|---|---|---|
+| `geofence_settings` | `GeofenceSetting` (`employees/models.py`) | FK'd to `Business` and optionally `BusinessLocation` (null = business-wide), instead of whatever the old schema used. `enabled=False` (or no row) means geofencing isn't enforced for that scope. |
+| `time_tracking` | `TimeEntry` | FK'd to `BusinessMembership` instead of a direct `user_id`. Stores raw client-reported coordinates (`clock_in_lat`/`lng`, `clock_out_lat`/`lng`) separately from the server-computed, audit-only `clock_in_distance_meters`/`clock_in_within_geofence` fields — the client's own opinion of its location is never trusted as the verdict. |
+| `time_tracking_breaks` | `TimeEntryBreak` | FK'd to `TimeEntry`. Same one-open-at-a-time state machine as clock-in/out. |
+| *(no old equivalent)* | `LocationVerificationLog` | New. Audit trail of every geofence check attempt — including rejected clock-in/out attempts that never produced a `TimeEntry` at all. Without this, a hard-blocked attempt would leave no record anywhere. |
+
+**The actual security fix:** the original frontend (`src/lib/geolocation.ts`)
+computed Haversine distance in the browser and trusted the client's own
+"within range" boolean — trivially spoofable by anyone who can edit a JS
+variable or replay a request with a forged payload. `employees/services.py`
+(`haversine_distance_meters`, `verify_geofence`) now computes that distance
+server-side from raw lat/lng, for both clock-in and clock-out, and that
+computed value — never a client-sent one — is what's stored and what
+clock-in/out approval is based on.
+
+**Concurrency:** clock-in locks the relevant `BusinessMembership` row
+(`select_for_update()` inside `transaction.atomic()`) before checking for
+an existing open `TimeEntry`, since a brand-new clock-in has no `TimeEntry`
+row yet to lock. Clock-out and break actions lock the existing open
+`TimeEntry` row instead. A DB-level `UniqueConstraint` (one open `TimeEntry`
+per membership, one open `TimeEntryBreak` per `TimeEntry`) backs this up as
+a second line of defense.
+
+**Geofencing: hard block vs flag.** A clock-in or clock-out outside the
+configured radius is currently a hard block — the request is rejected
+outright with a 400, no `TimeEntry` is created/updated, and the attempt is
+still recorded in `LocationVerificationLog`. This was the simplest correct
+behavior to ship the actual security fix now, but it's a real product
+decision, not just an engineering one: a hard block means an employee with
+bad GPS reception (or a manager who legitimately needs to clock in from
+just outside the radius) is locked out entirely, with no way to clock in
+until someone fixes the geofence or their location. The alternative —
+allow the clock-in but flag it `within_geofence=False` for manager review —
+is already fully supported by the data model (every field needed for that
+review exists today), it just isn't wired up as a per-business toggle yet.
+**This should be revisited deliberately** as a `Business`/`GeofenceSetting`-level
+configurable choice once there's product input on which businesses need
+which behavior, rather than assumed away. See the `TODO` in
+`employees/services.py:clock_in`.
+
+**Endpoints** (all under `core.permissions.HasBusinessRole`, same tenant-scoping pattern as Customers):
+
+- `GET/POST /api/businesses/<business_id>/geofence-settings/` and `GET/PUT/PATCH/DELETE .../<id>/` — manager+ only.
+- `GET /api/businesses/<business_id>/time-entries/` and `GET .../<id>/` — read-only list/retrieve.
+- `POST /api/businesses/<business_id>/time-entries/clock-in/` and `.../clock-out/` — body: `{"latitude": ..., "longitude": ...}`. Acts on the caller's own membership for that business; there is no way to clock another membership in/out through this API.
+- `POST /api/businesses/<business_id>/time-entries/break-start/` and `.../break-end/` — no body; acts on the caller's own currently-open `TimeEntry`.
+
+These are explicit state-transition actions, not generic CRUD — `TimeEntry`
+and `TimeEntryBreak` have no create/update/delete endpoint at all, only the
+service-layer functions in `employees/services.py` can mutate them.
+
 ## Security hardening notes (for when each domain is built)
 
 These are commitments made now so they aren't lost by the time the
@@ -171,11 +234,12 @@ specific note:
 - **Loyalty/gift cards/inventory/finance**: balance and status mutations go
   through `transaction.atomic()` + `select_for_update()` service functions.
   No client-trusted balance math.
-- **Employee geofencing**: server computes the Haversine distance from
-  submitted GPS coordinates; never trust a client-sent "within range"
-  boolean.
-- **Clock-in/out**: a real server-side state machine (no clock-out without
-  an open clock-in, no double clock-in).
+- **Employee geofencing**: **Built.** Server computes the Haversine distance
+  from submitted GPS coordinates server-side; never trusts a client-sent
+  "within range" boolean. See "Employees & Time Tracking domain" above.
+- **Clock-in/out**: **Built.** A real server-side state machine (no
+  clock-out without an open clock-in, no double clock-in), backed by
+  `select_for_update()` + a DB-level unique constraint.
 - **Public tracking beacon** (`marketing`): real server-side rate limiting
   keyed by IP + script_key (DRF scoped throttling or django-ratelimit), not
   the old client-side localStorage limiter.

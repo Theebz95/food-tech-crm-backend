@@ -5,6 +5,7 @@ urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/finance/", include("finance.urls")),
     path("api/", include("customers.urls")),
+    path("api/", include("employees.urls")),
     # Additional app urls.py files get wired in here as each domain is
     # built out in follow-up sessions.
 ]
