@@ -7,6 +7,8 @@ urlpatterns = [
     path("api/", include("customers.urls")),
     path("api/", include("employees.urls")),
     path("api/", include("reservations.urls")),
+    path("api/", include("inventory.urls")),
+    path("api/", include("documents.urls")),
     # Public, unauthenticated guest-booking routes — deliberately mounted
     # under a distinct prefix rather than alongside the HasBusinessRole
     # routes above, so it's unmistakable at the routing level which

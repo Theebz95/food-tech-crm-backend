@@ -172,6 +172,19 @@ SUPABASE_JWT_SECRET = env("SUPABASE_JWT_SECRET", "placeholder-jwt-secret")
 SUPABASE_JWT_AUDIENCE = env("SUPABASE_JWT_AUDIENCE", "authenticated")
 SUPABASE_SERVICE_ROLE_KEY = env("SUPABASE_SERVICE_ROLE_KEY", "")
 
+# --- Supabase Storage (S3-compatible — see documents/storage.py) -------------
+# Project Settings -> Storage -> S3 Connection in the Supabase dashboard.
+# These are separate credentials from SUPABASE_SERVICE_ROLE_KEY above.
+SUPABASE_STORAGE_ENDPOINT_URL = env(
+    "SUPABASE_STORAGE_ENDPOINT_URL", "https://your-project.supabase.co/storage/v1/s3"
+)
+SUPABASE_STORAGE_BUCKET = env("SUPABASE_STORAGE_BUCKET", "documents")
+SUPABASE_STORAGE_ACCESS_KEY_ID = env("SUPABASE_STORAGE_ACCESS_KEY_ID", "placeholder-access-key-id")
+SUPABASE_STORAGE_SECRET_ACCESS_KEY = env("SUPABASE_STORAGE_SECRET_ACCESS_KEY", "placeholder-secret-access-key")
+# Supabase Storage doesn't have real AWS regions, but boto3's S3 client
+# requires a region_name — any value works; Supabase ignores it.
+SUPABASE_STORAGE_REGION = env("SUPABASE_STORAGE_REGION", "us-east-1")
+
 # --- Stripe --------------------------------------------------------------------
 STRIPE_SECRET_KEY = env("STRIPE_SECRET_KEY", "sk_test_placeholder")
 STRIPE_WEBHOOK_SECRET = env("STRIPE_WEBHOOK_SECRET", "whsec_placeholder")

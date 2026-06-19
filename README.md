@@ -66,7 +66,9 @@ Copy the `whsec_...` it prints into `STRIPE_WEBHOOK_SECRET` in `.env`.
 | `customers` | **Built.** `Customer`, `CustomerProfile`, `CustomerBusinessLink` models + DRF CRUD for `Customer` (`HasBusinessRole`-scoped) + server-side email/phone validation. See "Customers domain" below for the old-table mapping. |
 | `employees` | **Built.** Time tracking + geofencing, scheduling (recurring schedules expanded server-side via Celery Beat), shift swaps, time off, and pay stubs. See "Employees domain" below — including the pay stub tax disclaimer. |
 | `reservations` | **Built.** Tables, floor plans, business hours, blackout dates, reservation settings, reservations, and a waitlist — staff CRUD (`HasBusinessRole`) plus a separate, intentionally unauthenticated guest-booking flow. See "Reservations domain" below, including the guest-booking permission model. |
-| `loyalty`, `inventory`, `documents`, `marketing`, `settings` | **Placeholders only.** Each `models.py` documents what's planned and which Phase 1 audit findings / Phase 2 architectural decisions it needs to address. No models, views, or URLs yet. |
+| `inventory` | **Built.** Vendors, inventory items, and an append-only transaction ledger — stock changes only ever happen through `adjust_stock()` (`transaction.atomic()` + `select_for_update()`), never a direct quantity write. See "Inventory domain" below. |
+| `documents` | **Built.** File metadata + Supabase Storage (S3-compatible) integration, fixing the old upload-orphan risk with a write-ahead `pending` row. See "Documents domain" below for the chosen strategy and why. |
+| `loyalty`, `marketing`, `settings` | **Placeholders only.** Each `models.py` documents what's planned and which Phase 1 audit findings / Phase 2 architectural decisions it needs to address. No models, views, or URLs yet. |
 
 ## The new tenancy model vs. the old one
 
@@ -417,15 +419,137 @@ read-only field could still theoretically be probed.
    code instead, proven by `reservations.tests.ConfirmationCodeCollisionTests`
    forcing a collision via a mocked generator.
 
+## Inventory domain
+
+Vendors, inventory items, and a stock-change ledger.
+
+| Old (Supabase) | New (Django) | Notes |
+|---|---|---|
+| `vendors` | `Vendor` (`inventory/models.py`) | FK'd to `Business`. |
+| `inventory_items` | `InventoryItem` | FK'd to `Business` and optionally `BusinessLocation` (null = business-wide — same convention as `GeofenceSetting`, unlike the Reservations domain's required location). `current_quantity`/`low_stock_threshold` are `Decimal`, not integer, since units like kg/liter are fractional. |
+| `inventory_transactions` / `inventory_usage` | `InventoryTransaction` | **One unified ledger, not two models** — restock, usage, waste, and manual correction are all "item, quantity_change, who, when," distinguished by `transaction_type`. A separate `InventoryUsage` model would duplicate the same columns/constraints for no behavioral difference; the old system's separate `useAdjustStock()`/`useRecordUsage()` hooks were the same operation under two names. |
+
+**The actual fix (Phase 1 audit finding):** stock-level updates used to be
+a non-atomic two-step client write — update the item's quantity, then
+insert a ledger row — the same risk class as the Loyalty/gift-card balance
+pattern documented in `loyalty/models.py`, just lower stakes.
+`inventory/services.py:adjust_stock` is now the *only* way
+`InventoryItem.current_quantity` changes after creation: it locks the item
+row (`select_for_update()` inside `transaction.atomic()`), recomputes the
+new quantity, and **rejects** (raises `InsufficientStockError`) rather
+than silently clamps an adjustment that would take stock negative — the
+quantity write and the ledger insert happen in the same transaction, so
+they can never disagree. Proven by a real multi-thread test
+(`inventory.tests.StockAdjustmentConcurrencyTests`: quantity=1, two
+concurrent -1 deductions, exactly one succeeds and the other is rejected —
+not both succeeding (lost update) and not both being rejected).
+
+`InventoryTransaction` enforces append-only at the model level, not just
+by omitting a write endpoint: `save()` raises on any attempt to update an
+existing row, and `delete()` always raises (`inventory.tests.LedgerImmutabilityTests`).
+
+`current_quantity` is writable on `InventoryItem` create (setting a
+starting balance is establishing a baseline, not logging a change) but
+rejected on update (`InventoryItemSerializer.validate`) — every change
+after creation must go through `POST .../inventory-items/<id>/adjust-stock/`
+so it's always recorded in the ledger.
+
+**Endpoints** (all under `core.permissions.HasBusinessRole`):
+
+- `/api/businesses/<business_id>/vendors/` — CRUD.
+- `/api/businesses/<business_id>/inventory-items/` — CRUD (`current_quantity` locked on update, see above). `.../low-stock/` lists items at or below their `low_stock_threshold`. `.../<id>/adjust-stock/` (`{"delta": ..., "transaction_type": ..., "reason": ...}`) is the only way to change quantity post-creation.
+- `/api/businesses/<business_id>/inventory-transactions/` — read-only list/retrieve. No create/update/delete route exists; the only way a row gets created is the adjust-stock action above.
+
+## Documents domain
+
+| Old (Supabase) | New (Django) | Notes |
+|---|---|---|
+| `documents` | `Document` (`documents/models.py`) | FK'd to `Business`. `storage_key` is the object key in Supabase Storage — server-generated (`{business_id}/{uuid4}-{filename}`), never client-supplied. `status` (`pending`/`uploaded`/`failed`) is the mechanism behind the fix below. |
+
+**The actual fix (Phase 1 audit finding) and the strategy chosen.** The
+old flow uploaded straight to Supabase Storage from the browser, then made
+a separate call to insert the metadata row — if that second call failed,
+the file was already sitting in storage with **no database record of it
+at all**, discoverable only by walking the bucket directly.
+
+Two ways to close that were on the table:
+
+- **(a) DB row first, in a `pending` state, then upload, then mark
+  `uploaded`.** Chosen.
+- (b) Upload first, then a compensating delete of the just-uploaded file
+  if the DB insert fails.
+
+(a) wins because the DB row always exists *before* any file does — a
+failed upload (`documents/services.py:upload_document`) can only ever
+produce a `failed` row pointing at a storage key that was never actually
+written. There is no code path where a real file exists with zero
+database trace, because every storage key that's ever written is one a
+row already pointed at first. (b) requires a compensating delete that can
+itself fail (storage unreachable, timeout, whatever caused the original
+failure also taking out the cleanup call) — which reintroduces exactly the
+orphan risk it's supposed to close, just shifted one step later.
+
+Delete (`documents/services.py:delete_document`) mirrors this: **storage
+delete first, then the DB row.** If the storage delete fails, the row
+survives — a visible, retryable state — rather than deleting the row
+first and risking an untracked file with the record already gone (the
+same bug, in reverse). Proven directly, not just inferred from the code's
+ordering: `documents.tests.DocumentUploadTests` mocks the storage call to
+raise and confirms the result is exactly one `failed` row (not a phantom
+file, not a stuck `pending` row, not a crash); `DocumentDeleteTests`
+mocks a failing storage delete and confirms the row is still there
+afterward.
+
+**Residual case, documented rather than hidden:** if the upload itself
+succeeds but the immediately-following "mark `uploaded`" field write
+fails (a plain DB write on an existing row — possible but far less likely
+than the upload itself failing), the row is left on `pending` while a real
+file exists in storage. This is *not* an orphan — the row still exists and
+still points at the right key — just an inaccurate status, recoverable by
+re-checking storage or re-running the mark-complete step. Far narrower and
+more recoverable than the original bug.
+
+**Storage backend:** Supabase Storage's S3-compatible API via `boto3`
+(`documents/storage.py`), not Django's storage abstraction
+(`django-storages` etc) — `upload_document`/`delete_document` need
+precise control over the order of operations above, and a thin set of
+plain functions (`upload_file`/`delete_file`/`get_presigned_url`) is
+trivially mockable in tests without faking out `FileField`/`Storage`
+machinery. Credentials: `SUPABASE_STORAGE_ENDPOINT_URL`/`_BUCKET`/`_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY`/`_REGION`
+in `.env` (separate from `SUPABASE_SERVICE_ROLE_KEY`) — same
+placeholder-via-`.env` pattern as the Postgres connection string.
+
+**Download:** a presigned URL (`GET .../download/` → `{"url": "..."}`),
+not proxied through a Django view — this lets Supabase's storage edge
+serve the bytes directly instead of tying up a Django worker process
+streaming a potentially large file.
+
+**Endpoints** (`core.permissions.HasBusinessRole`):
+
+- `GET /api/businesses/<business_id>/documents/` / `.../<id>/` — list/retrieve.
+- `POST /api/businesses/<business_id>/documents/` — multipart upload (`file`, optional `name`); goes through `services.upload_document`, never generic `ModelViewSet.create()`.
+- `GET /api/businesses/<business_id>/documents/<id>/download/` — presigned URL; 400 if the document isn't in `uploaded` status.
+- `DELETE /api/businesses/<business_id>/documents/<id>/` — goes through `services.delete_document` (storage then row), never generic `ModelViewSet.destroy()`.
+
 ## Security hardening notes (for when each domain is built)
 
 These are commitments made now so they aren't lost by the time the
 relevant app is implemented — see each placeholder `models.py` for the
 specific note:
 
-- **Loyalty/gift cards/inventory/finance**: balance and status mutations go
+- **Loyalty/gift cards/finance**: balance and status mutations go
   through `transaction.atomic()` + `select_for_update()` service functions.
   No client-trusted balance math.
+- **Inventory stock adjustments**: **Built.** Every quantity change goes
+  through `inventory/services.py:adjust_stock` (`transaction.atomic()` +
+  `select_for_update()` on the `InventoryItem` row), which rejects an
+  adjustment that would take stock negative instead of clamping it. See
+  "Inventory domain" above.
+- **Document upload orphan risk**: **Built.** DB row written first, in a
+  `pending` state, before the storage upload is attempted — a failed
+  upload can only ever produce a `failed` row, never a real file with no
+  database record. See "Documents domain" above for the full reasoning
+  and the alternative considered.
 - **Employee geofencing**: **Built.** Server computes the Haversine distance
   from submitted GPS coordinates server-side; never trusts a client-sent
   "within range" boolean. See "Employees domain" above.
