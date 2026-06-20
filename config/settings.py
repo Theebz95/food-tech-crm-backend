@@ -210,6 +210,13 @@ STRIPE_PRICE_TIME_TRACKING_ADDON = env("STRIPE_PRICE_TIME_TRACKING_ADDON", "")
 STRIPE_PRICE_LOYALTY_ADDON = env("STRIPE_PRICE_LOYALTY_ADDON", "")
 STRIPE_PRICE_RESERVATIONS_ADDON = env("STRIPE_PRICE_RESERVATIONS_ADDON", "")
 
+# --- Resend (core/email.py) -----------------------------------------------------
+# First email-sending integration in this codebase — see core/email.py
+# module docstring. Used today by loyalty's gift-card email flow; expected
+# to be reused by Finance for invoice emails when that's built.
+RESEND_API_KEY = env("RESEND_API_KEY", "re_placeholder")
+RESEND_FROM_EMAIL = env("RESEND_FROM_EMAIL", "noreply@example.com")
+
 # --- Celery / Celery Beat -------------------------------------------------------
 CELERY_BROKER_URL = env("CELERY_BROKER_URL", "redis://localhost:6379/0")
 CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
@@ -225,16 +232,30 @@ CELERY_BEAT_SCHEDULE = {
         "task": "core.tasks.check_expired_trials",
         "schedule": crontab(hour=0, minute=0),
     },
-    # Stub — raises NotImplementedError until the Finance domain (and its
-    # RecurringTransaction model) is built in a follow-up session.
-    "generate-due-recurring-transactions": {
-        "task": "finance.tasks.generate_due_recurring_transactions",
-        "schedule": crontab(hour=1, minute=0),
-    },
     # Replaces the old client-side, render-time recurring schedule
     # expansion — see employees/models.py module docstring "Security fix #2".
     "expand-recurring-schedules": {
         "task": "employees.tasks.expand_recurring_schedules",
         "schedule": crontab(hour=2, minute=0),
+    },
+    # Replaces the old client-side "is this invoice/bill overdue"
+    # computation done on every page render — see finance/models.py
+    # "Finance domain" docstring and finance/tasks.py.
+    "mark-overdue-invoices": {
+        "task": "finance.tasks.mark_overdue_invoices",
+        "schedule": crontab(hour=3, minute=0),
+    },
+    "mark-overdue-bills": {
+        "task": "finance.tasks.mark_overdue_bills",
+        "schedule": crontab(hour=3, minute=5),
+    },
+    # Replaces the old client-side, manually triggered recurring
+    # transaction generation (useGenerateRecurringTransaction() in the
+    # old frontend) — supersedes the old "generate-due-recurring-transactions"
+    # stub entry; see finance/tasks.py:expand_recurring_transactions for
+    # why the design changed, not just the name.
+    "expand-recurring-transactions": {
+        "task": "finance.tasks.expand_recurring_transactions",
+        "schedule": crontab(hour=2, minute=30),
     },
 }

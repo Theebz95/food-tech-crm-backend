@@ -11,6 +11,11 @@ EmployeeShift rows from a RecurringSchedule, and it's idempotent: calling
 it again for a date that already has a shift is a no-op, backed by the
 `unique_shift_per_recurring_schedule_occurrence` DB constraint
 (EmployeeShift.Meta.constraints) as well as the get_or_create() below.
+
+The actual weekly/biweekly/monthly date-stepping logic lives in
+`core.recurrence` — extracted there so finance.recurring (RecurringTransaction
+-> Invoice/Bill expansion) can reuse it instead of duplicating it. `occurrence_dates`
+below is a thin wrapper preserving this module's original signature/behavior.
 """
 
 from datetime import datetime, timedelta
@@ -18,19 +23,9 @@ from datetime import datetime, timedelta
 from django.db.models import Q
 from django.utils import timezone
 
+from core.recurrence import occurrence_dates as _shared_occurrence_dates
+
 from .models import EmployeeShift, RecurringSchedule
-
-
-def _next_weekday_on_or_after(start_date, weekday):
-    """First date >= start_date falling on the given weekday (0=Monday)."""
-    delta = (weekday - start_date.weekday()) % 7
-    return start_date + timedelta(days=delta)
-
-
-def _add_month(d):
-    if d.month == 12:
-        return d.replace(year=d.year + 1, month=1)
-    return d.replace(month=d.month + 1)
 
 
 def occurrence_dates(schedule: RecurringSchedule, window_start, window_end):
@@ -39,43 +34,14 @@ def occurrence_dates(schedule: RecurringSchedule, window_start, window_end):
     `schedule` should produce a shift, given its recurrence_rule and the
     schedule's own start_date/end_date bounds.
     """
-    effective_start = max(schedule.start_date, window_start)
-    effective_end = window_end if schedule.end_date is None else min(schedule.end_date, window_end)
-    if effective_start > effective_end:
-        return
-
-    if schedule.recurrence_rule == RecurringSchedule.Recurrence.MONTHLY:
-        day_of_month = schedule.start_date.day
-        current = effective_start.replace(day=1)
-        while current <= effective_end:
-            try:
-                occurrence = current.replace(day=day_of_month)
-            except ValueError:
-                # e.g. day 31 in a 30-day month — skip that month rather
-                # than silently shifting to a different day.
-                occurrence = None
-            if occurrence is not None and effective_start <= occurrence <= effective_end:
-                yield occurrence
-            current = _add_month(current)
-        return
-
-    step_days = 7 if schedule.recurrence_rule == RecurringSchedule.Recurrence.WEEKLY else 14
-    weekday_target = schedule.shift_template.day_of_week
-    # Anchor to the schedule's actual start, not the window, so a biweekly
-    # schedule keeps the same weekly phase every time this is called —
-    # otherwise re-running against a later window could shift which weeks
-    # are "on" vs "off".
-    anchor = _next_weekday_on_or_after(schedule.start_date, weekday_target)
-    if effective_start <= anchor:
-        current = anchor
-    else:
-        days_since_anchor = (effective_start - anchor).days
-        remainder = days_since_anchor % step_days
-        current = effective_start if remainder == 0 else effective_start + timedelta(days=step_days - remainder)
-
-    while current <= effective_end:
-        yield current
-        current += timedelta(days=step_days)
+    yield from _shared_occurrence_dates(
+        schedule.recurrence_rule,
+        schedule.start_date,
+        schedule.end_date,
+        schedule.shift_template.day_of_week,
+        window_start,
+        window_end,
+    )
 
 
 def expand_recurring_schedule(schedule: RecurringSchedule, window_start, window_end) -> int:

@@ -45,9 +45,9 @@ celery -A config beat -l info
 ```
 
 The worker executes tasks; beat is the scheduler that enqueues them on a
-cron-like schedule (currently: `check_expired_trials` daily at 00:00 UTC,
-and the `generate_due_recurring_transactions` stub at 01:00 UTC — see
-`config/settings.py` -> `CELERY_BEAT_SCHEDULE`).
+cron-like schedule (`check_expired_trials`, `expand_recurring_schedules`,
+`mark_overdue_invoices`/`mark_overdue_bills`, `expand_recurring_transactions`,
+all daily — see `config/settings.py` -> `CELERY_BEAT_SCHEDULE`).
 
 ### Stripe webhook (local testing)
 
@@ -62,14 +62,15 @@ Copy the `whsec_...` it prints into `STRIPE_WEBHOOK_SECRET` in `.env`.
 |---|---|
 | `core` | **Built.** `Business`, `BusinessLocation`, `BusinessMembership` models + `HasBusinessRole`/`IsBusinessManager`/`IsBusinessOwner` permission classes + `check_expired_trials` Celery task. |
 | `authentication` | **Built.** Custom `User` model (Supabase-id-keyed), `SupabaseAuthentication` DRF auth class, `IsSuperAdmin` permission class. |
-| `finance` | **Partially built.** Stripe webhook endpoint (`webhooks.py`) and a stub `generate_due_recurring_transactions` task — both exist ahead of the domain models because they're new infrastructure / already wired into Celery Beat. No Finance models yet. |
+| `finance` | **Built — both parts complete.** Invoicing, payments, estimates, the Stripe webhook, bills/bill payments, bank transactions (manual entry only), recurring transactions (Invoice/Bill generation), chart of accounts, and AR/AP aging reports. See "Finance domain" below. |
 | `customers` | **Built.** `Customer`, `CustomerProfile`, `CustomerBusinessLink` models + DRF CRUD for `Customer` (`HasBusinessRole`-scoped) + server-side email/phone validation. See "Customers domain" below for the old-table mapping. |
 | `employees` | **Built.** Time tracking + geofencing, scheduling (recurring schedules expanded server-side via Celery Beat), shift swaps, time off, and pay stubs. See "Employees domain" below — including the pay stub tax disclaimer. |
 | `reservations` | **Built.** Tables, floor plans, business hours, blackout dates, reservation settings, reservations, and a waitlist — staff CRUD (`HasBusinessRole`) plus a separate, intentionally unauthenticated guest-booking flow. See "Reservations domain" below, including the guest-booking permission model. |
 | `inventory` | **Built.** Vendors, inventory items, and an append-only transaction ledger — stock changes only ever happen through `adjust_stock()` (`transaction.atomic()` + `select_for_update()`), never a direct quantity write. See "Inventory domain" below. |
 | `documents` | **Built.** File metadata + Supabase Storage (S3-compatible) integration, fixing the old upload-orphan risk with a write-ahead `pending` row. See "Documents domain" below for the chosen strategy and why. |
 | `marketing` | **Built.** Website tracking (scripts, visitors, page views, events), leads, form submissions, and Google Ads campaign metadata — a public, unauthenticated tracking beacon + form endpoint (server-side rate limited, payload-validated) alongside staff CRUD. See "Marketing domain" below, including the `script_key` threat model. |
-| `loyalty`, `settings` | **Placeholders only.** Each `models.py` documents what's planned and which Phase 1 audit findings / Phase 2 architectural decisions it needs to address. No models, views, or URLs yet. |
+| `settings` | **Built.** `BusinessProfile` — logo, contact info, address, default timezone, notification preference toggles. See "Settings domain" below for which old settings tables this covers vs. where the rest already live (Employees, Reservations). |
+| `loyalty` | **Placeholder only.** `models.py` documents what's planned and which Phase 1 audit findings / Phase 2 architectural decisions it needs to address. No models, views, or URLs yet. |
 
 ## The new tenancy model vs. the old one
 
@@ -140,7 +141,8 @@ Pulled directly from the Phase 1 SQL audit of the old `supabase/migrations`:
 | `calculate_reservation_end_time()` / `set_reservation_end_time` trigger | Same `Reservation.save()` override: `end_time = start_time + timedelta(minutes=duration_minutes)` if not explicitly set | **Built** (`reservations/models.py`) |
 | `is_superadmin(uuid)` / `has_role()` RPC | `User.is_superadmin` boolean + `IsSuperAdmin` DRF permission class | **Built** (`authentication/`) |
 | `sync_customer_to_portal_account()` / `sync_customer_to_portal` trigger (kept a linked portal account's name/phone in sync with the customer row) | **Moot** under unified auth — see "Customers domain" below for the full mapping | N/A |
-| Gift card balance, loyalty points accrual, invoice/payment status transitions | **No DB trigger existed for these even in the old system** — confirmed by grepping every migration; only the generic `updated_at` trigger touched those tables. All of that math was client-side. In this backend it becomes service-layer functions wrapped in `transaction.atomic()` + `select_for_update()` (see `loyalty/models.py`, `finance/models.py`) | Not implemented until those apps are built |
+| Invoice/payment/bill status transitions | **No DB trigger existed for these even in the old system** — confirmed by grepping every migration; only the generic `updated_at` trigger touched those tables. All of that math was client-side. Now `finance/services.py`: `transaction.atomic()` + `select_for_update()`, never trusting a client-sent total. | **Built** (`finance/`) |
+| Gift card balance, loyalty points accrual | Same old finding (no DB trigger, client-side math) — will become service-layer functions wrapped in `transaction.atomic()` + `select_for_update()` (see `loyalty/models.py`) the same way `finance/services.py` does it | Not implemented until `loyalty` is built |
 | `check_expired_trials()` function + `pg_cron` daily job | `core.tasks.check_expired_trials` Celery Beat task, same three-step logic (expire -> reactivate -> re-expire), against `Business` instead of `profiles` | **Built** |
 
 ## Customers domain
@@ -676,6 +678,330 @@ every other domain):
 - `/api/businesses/<business_id>/form-submissions/` — read-only (`ip_address` never included — see above).
 - `/api/businesses/<business_id>/google-ads-campaigns/` — CRUD; `access_token`/`refresh_token` write-only.
 
+## Settings domain
+
+The old `settings`-shaped tables didn't all end up in one place — most of
+them turned out to belong to the domain that actually uses them, not a
+generic settings bucket. To avoid confusion later about where to look for
+a given setting, here's where every one of them actually lives:
+
+| Old (Supabase) | New home | Notes |
+|---|---|---|
+| `geofence_settings` | `employees.GeofenceSetting` | Clock-in/out radius config — belongs with Employees, not here. |
+| `business_hours` | `reservations.BusinessHours` | Belongs with Reservations (it's what availability is computed against), not here. |
+| `reservation_settings` | `reservations.ReservationSetting` | Booking window/buffer/party-size policy — belongs with Reservations. |
+| `customer_portal_settings` | **Moot.** No separate portal auth system exists under unified auth — see "Customers domain" above. | N/A |
+| `break_settings` | Folded into `employees` if/when break-specific policy (beyond the existing open/close break state machine) is needed — nothing in the old schema needed its own table for this beyond what `TimeEntryBreak` already covers. | N/A |
+| *(business profile fields, scattered across `profiles`/business tables in the old schema)* | `BusinessProfile` (`settings/models.py`) | **This is what's actually new here:** logo, contact info, address, a business-wide default timezone, and notification preference toggles. |
+
+So this app (`settings`, Django app label `business_settings` — see
+`settings/apps.py` for why the label differs from the package name) ends
+up covering meaningfully less than its old-table list once suggested.
+That's intentional, not a gap: each setting lives with the domain that
+reads it, the same way `core.permissions.HasBusinessRole` lives in `core`
+rather than being re-implemented per domain.
+
+### BusinessProfile, not a Business field
+
+`BusinessProfile` is its own model (`OneToOneField(Business)`,
+auto-created with defaults on first `GET` — same singleton-per-business
+pattern as `reservations.ReservationSetting`), not new fields bolted onto
+`core.Business`. `core` is deliberately domain-agnostic — every other
+domain FKs into it, it never FKs into a domain — and `BusinessProfile`
+needs a real FK to `documents.Document` for the logo (next section),
+which `core.Business` can't have without inverting that direction.
+
+### Logo upload reuses Documents directly, not a second flow
+
+`BusinessProfile.logo` is a literal `ForeignKey` to `documents.Document` —
+not a second copy of `storage_key`/`status`/`content_type` fields.
+Uploading or replacing a logo (`settings.services.set_logo`) calls
+`documents.services.upload_document` directly; removing one
+(`remove_logo`) calls `documents.services.delete_document` directly. This
+gets the exact same orphan-prevention guarantee Documents already has —
+the DB row exists before any storage write is attempted, so a failed
+upload produces a `failed` `Document` row, never a file with no record —
+without a second implementation of that state machine to keep in sync
+with the first. Proven the same way `documents.tests` proves it for
+Documents itself: `settings.tests.LogoUploadTests` mocks the storage call
+to fail and confirms there's still no orphan, and separately confirms a
+failed *replacement* upload never touches the still-good existing logo
+(the new `Document` row is created and attempted first; the old one is
+only swapped out, and only then deleted, after the new upload actually
+succeeds).
+
+This is the first cross-domain dependency in this codebase (`settings` →
+`documents`) — every other domain so far only depends on `core`/`authentication`.
+Justified specifically because the alternative (re-implementing the
+pending → uploaded/failed flow a second time for one more file field) is
+exactly the kind of duplication this fix is supposed to avoid.
+
+### Role gating
+
+Read access (`GET`) is open to any business member
+(`core.permissions.HasBusinessRole`'s default STAFF+); updating profile
+fields and both logo actions require `IsBusinessManager` (MANAGER+/OWNER).
+Staff can see business settings but not change them. `BusinessProfileView`
+additionally re-checks business membership inside `_get_business()`
+(independent of the permission class), so this view has the unusual
+property of two layers that each independently block a cross-tenant
+request — `settings.tests` confirms the isolation tests still fail if
+*both* are deliberately disabled at once, not just one.
+
+### Endpoints
+
+All under `core.permissions.HasBusinessRole`/`IsBusinessManager`:
+
+- `GET /api/businesses/<business_id>/profile/` — any member; auto-creates with defaults on first access.
+- `PATCH`/`PUT /api/businesses/<business_id>/profile/` — manager+; `logo` is read-only here (set only via the actions below).
+- `POST /api/businesses/<business_id>/profile/upload-logo/` — manager+; multipart `file` (+ optional `name`).
+- `DELETE /api/businesses/<business_id>/profile/logo/` — manager+; clears the logo and deletes the underlying `Document`. A no-op (200, `logo: null`) if none is set.
+
+## Finance domain — complete
+
+Built across two sessions; both parts are done. Part 1: invoicing,
+payments, estimates, a minimal chart of accounts, and the Stripe webhook.
+Part 2: bills/bill payments, bank transactions (manual entry only — see
+below), recurring transactions (Invoice/Bill generation), and AR/AP aging
+reports.
+
+| Old (Supabase) | New (Django) | Notes |
+|---|---|---|
+| `invoices` | `Invoice` (`finance/models.py`) | FK'd to `Business` and `Customer` (`PROTECT` — a customer with invoice history can't be deleted, only deactivated). `invoice_number` is server-generated and unique per business (`InvoiceNumberSequence`, locked/incremented in the same transaction as the invoice — never `Business` itself, to avoid contending with unrelated operations elsewhere that also touch that row). |
+| `invoice_line_items` | `InvoiceLineItem` | **No `tax_rate` field** — see "Tax calculation" below for why; the real source applies one tax type to the whole document, not per line. |
+| `payments` | `Payment` | FK'd to `Business` and optionally `Invoice` (nullable — a standalone payment not tied to one). Append-only, same enforcement as `inventory.InventoryTransaction` (`save()`/`delete()` raise on an existing row). Refunds/reversals aren't built (would be a compensating entry, not an edit to this row). |
+| `estimates` / `estimate_line_items` | `Estimate` / `EstimateLineItem` | Same shape as `Invoice`/`InvoiceLineItem`. `.../convert-to-invoice/` creates a real `Invoice` from one and locks it against re-conversion (`Estimate.status = converted`). |
+| `invoice_templates` | `InvoiceTemplate` | `line_item_presets` is plain JSON — it's only ever a pre-fill default; applying one copies its presets into real, validated `InvoiceLineItem` rows on the invoice actually being created. |
+| `chart_of_accounts` | `ChartOfAccount` | **Minimal version** — `name`/`code`/`account_type`, just enough for `Invoice.revenue_account`/`Payment.deposit_account`/`Bill.expense_account`/`BillPayment.payment_account` to optionally reference one. Hierarchical accounts, balances, and journal entries were never requested and aren't built. |
+| `bills` / `bill_line_items` | `Bill` / `BillLineItem` (`finance/models.py`) | Mirrors `Invoice`/`InvoiceLineItem` exactly — same tax/discount shape (`finance/tax.py`), same server-generated sequential numbering (`BillNumberSequence`, independent counter from `InvoiceNumberSequence`), same no-`tax_rate`-on-line-items reasoning. FK'd to `inventory.Vendor` (`PROTECT`, same reasoning as `Invoice.customer`). |
+| `bill_payments` | `BillPayment` | Mirrors `Payment` exactly — append-only, same locked/recomputed-sum/reject-overpayment shape in `services.record_bill_payment`. Deliberately not a new pattern: an owed document + payments against it + paid-when-covered is the same problem either direction. |
+| `bank_transactions` | `BankTransaction` | **Manual entry only** — see "Bank transactions" below. |
+| `recurring_transactions` | `RecurringTransaction` | Generates `Invoice` or `Bill` rows on a schedule — see "Recurring transactions" below. |
+| *(no old equivalent — see below)* | `StripeWebhookEvent`, `InvoiceNumberSequence`, `EstimateNumberSequence`, `BillNumberSequence` | New infrastructure rows, no old-table equivalent. |
+
+### Tax calculation — ported, not approximated
+
+`finance/tax.py` is a direct port of the old frontend's `tax-utils.ts`
+(reproduced in full in that module's docstring for reference). Two things
+worth being explicit about, since they're the kind of detail that's easy
+to silently get wrong when porting:
+
+1. **5 fixed tax options, no province/region lookup at all** — `ZERO`
+   (0%), `GST_5` (5%), `HST_15` (15%), `GST_QST_14975` (14.975%), all 4
+   ported directly from the original source, plus `QST_9975` (9.975%)
+   added afterward on explicit instruction with the exact rate given —
+   not guessed, and called out in `finance/tax.py`'s module docstring as
+   not part of the original file. There is no per-province rate table
+   anywhere in the source being ported. An unrecognized tax type doesn't
+   error — it falls back to 0%, exactly matching the original's
+   `TAX_OPTIONS.find(...)?.rate || 0` (`get_tax_rate`'s docstring covers
+   why this is the actual ported behavior, not a shortcut taken here).
+2. **Tax applies once per document, not per line item.** `calculateTotals()`
+   takes one `taxType` for the whole invoice/estimate and computes
+   `subtotal -> discount -> taxable_amount -> tax -> total` in that exact
+   order. `InvoiceLineItem`/`EstimateLineItem` only carry
+   `quantity`/`unit_price` — there's no per-line tax rate to port because
+   the source never reads one. `discount_type`/`discount_value`/`tax_type`
+   live on `Invoice`/`Estimate` themselves.
+
+The one deliberate adaptation: the calculation runs in `Decimal`, not
+floating point, and the result is quantized to 2 decimal places. Same
+algorithm, same rates, different rounding precision — consistent with how
+every other currency value in this codebase is computed (e.g.
+`employees/payroll.py`). `finance.tests.TaxCalculationTests` checks the
+ported function against hand-computed expected values for each tax
+option, a percentage discount, a fixed discount larger than the
+subtotal (floors at zero, doesn't go negative), and the unrecognized-type
+fallback.
+
+### Invoice/payment state machine
+
+The actual fix (Phase 1 audit finding): status transitions used to be
+computed ad hoc, client-side. Now:
+
+- `paid` is set **only** by `finance/services.py:record_payment` —
+  inside `transaction.atomic()` with `select_for_update()` on the
+  `Invoice` row, it recomputes the real sum of `Payment` rows (never
+  trusts a client-sent running total) and marks `paid` only when that sum
+  covers the full `total`. **Overpayment is rejected outright** (raises
+  `OverpaymentError`), not silently clamped or accepted-with-a-flag —
+  same invariant-violation handling as Inventory's negative-stock
+  rejection elsewhere in this codebase. Proven with a real multi-thread
+  test (`finance.tests.PaymentConcurrencyTests`: invoice total 100, two
+  concurrent payments of 80 each — exactly one succeeds, the other is
+  rejected, not both succeeding into a 160-paid lost-update).
+- `overdue` is set **only** by the daily `finance.tasks.mark_overdue_invoices`
+  Celery Beat task, never computed live on read. Only `sent` invoices past
+  `due_date` are touched — `draft`, `paid`, `cancelled`, and already-`overdue`
+  invoices are left alone.
+- `draft -> sent` and any-non-`paid` `-> cancelled` are explicit actions
+  (`.../send/`, `.../cancel/`); nothing else writes `status` directly.
+
+### The Stripe webhook — a real functional gap, now closed
+
+This was never a porting task — the old `create-checkout` Edge Function
+only ever started a Stripe Checkout session; nothing synced completion,
+renewals, or cancellations back into the database at all.
+`finance/webhooks.py` now actually implements the four handlers that
+existed only as TODO stubs before this session:
+
+| Event | Effect |
+|---|---|
+| `checkout.session.completed` | Links `stripe_customer_id`/`stripe_subscription_id` onto `Business` (resolved via `client_reference_id` — expected to be set to the Business's UUID when the Checkout Session is created; that creation step is the other half of this integration and isn't built yet, this webhook only consumes what Stripe sends back), sets `subscription_status = "active"`, `is_active = True`. |
+| `customer.subscription.updated` | Syncs `subscription_status` from Stripe's reported status (found via `stripe_subscription_id`). |
+| `customer.subscription.deleted` | Sets `subscription_status = "canceled"`; sets `is_active = False` unless the business `is_legacy`. |
+| `invoice.paid` | **Stripe's own subscription-billing "Invoice"** (the Business paying *us*), a completely different concept from this domain's `finance.Invoice` (the Business billing *their own* customers) — conflating the two would be a real bug, not a naming nitpick. Only ever touches `Business.is_active`/`subscription_status` (covers a `past_due` subscription catching back up); never creates a `finance.Payment` or `finance.Invoice`. |
+
+**Every "can't resolve a Business for this event" path is logged
+(`logging.getLogger("finance.webhooks")`, `WARNING`), never a silent
+no-op.** A `checkout.session.completed` with a missing/malformed
+`client_reference_id`, or any event whose Stripe id doesn't match a
+`Business`, still gets recorded as processed (retrying won't fix a
+reference that will never resolve) — but it's always logged first, since
+that situation is almost always a sign of a real integration problem (a
+misconfigured Checkout Session, a stale subscription id, a webhook
+pointed at the wrong environment) and silently dropping it would hide
+exactly the thing an operator needs to notice. Proven directly
+(`finance.tests.StripeWebhookTests`, several `test_*_is_logged` cases)
+rather than just asserting the response code.
+
+**Signature verification**: every request is verified against
+`STRIPE_WEBHOOK_SECRET` (`stripe.Webhook.construct_event`); malformed or
+incorrectly-signed requests get a 400 before any handler runs.
+
+**Idempotency**: Stripe can and will redeliver the same event. `StripeWebhookEvent.event_id`
+(Stripe's own `evt_...` id) is the primary key, so inserting one is an
+atomic "have I seen this before" check with no check-then-insert race.
+That insert and the handler's side effects share **one** `transaction.atomic()`
+block — if the handler raises, the whole thing (dedup row included) rolls
+back, so a Stripe retry after a real failure is reprocessed cleanly
+rather than being permanently skipped as "already seen." Proven directly
+(`finance.tests.StripeWebhookTests.test_replayed_event_id_is_a_no_op_not_double_applied`):
+the same event delivered twice results in the handler being called
+exactly once, not just one `StripeWebhookEvent` row existing.
+
+### Bills and bill payments — mirrored, not reinvented
+
+`Bill`/`BillLineItem`/`BillPayment` are structurally identical to
+`Invoice`/`InvoiceLineItem`/`Payment` — same tax/discount calculation,
+same sequential-numbering pattern, same locked/atomic
+`record_bill_payment` (rejects overpayment outright, exactly like
+`record_payment`), same append-only ledger enforcement. This was a
+deliberate choice, not laziness: a bill owed to a vendor and an invoice
+owed by a customer are mechanically the same problem (a document with a
+total, payments against it, paid-when-fully-covered) pointed in opposite
+directions. Proven independently for `Bill`, not just inferred from
+`Invoice`'s tests — `finance.test_part2.BillPaymentConcurrencyTests` runs
+the same two-concurrent-payments-of-80-against-a-100-total race for
+`Bill` that `finance.tests.PaymentConcurrencyTests` runs for `Invoice`.
+
+### Bank transactions — manual entry only
+
+`BankTransaction` supports exactly one entry path right now: manual,
+staff-created rows via `POST /api/businesses/<business_id>/bank-transactions/`.
+There is no bank-feed/Plaid (or similar) integration — `source`
+(`manual`/`imported`, default `manual`) and `external_transaction_id`
+(blank for every row created today) exist specifically so a future import
+job could populate this same model and de-duplicate against re-imports by
+`external_transaction_id`, without a schema change when that's built.
+Nothing in this session reads from or writes to any external bank API.
+
+Reconciliation (`POST .../bank-transactions/<id>/reconcile/`, body
+`{"target_type": "invoice"|"payment"|"bill"|"billpayment", "object_id": ...}`)
+links one `BankTransaction` to whichever of those four it actually
+matches, via a `GenericForeignKey` (`reconciled_content_type`/`reconciled_object_id`)
+gated by an explicit allow-list (`services.RECONCILIATION_MODELS`) — a
+bare `GenericForeignKey` doesn't restrict which models can be referenced
+on its own, and a bank line should never be reconcilable against an
+unrelated model or another business's row (`reconcile_bank_transaction`
+checks the target's `business_id` before linking).
+
+### Recurring transactions
+
+The actual fix (Phase 1 audit finding): recurring transaction generation
+used to be manually triggered from the frontend
+(`useGenerateRecurringTransaction()`), with no real scheduler at all.
+`RecurringTransaction` -> `Invoice`/`Bill` expansion
+(`finance/recurring.py`, daily via Celery Beat) reuses the exact same
+idempotent rolling-window pattern already proven for
+`employees.RecurringSchedule` -> `EmployeeShift` — including the literal
+date-stepping code, extracted to `core/recurrence.py` specifically so
+both domains share one tested implementation instead of two
+independently-maintained copies of the same weekly/biweekly/monthly math.
+`employees/scheduling.py:occurrence_dates` is now a thin wrapper around
+it; `employees/test_scheduling.py` still passes unchanged, proving the
+extraction didn't change that domain's behavior.
+
+`RecurringTransaction` carries its own embedded `line_item_presets` +
+`tax_type`/`discount_type`/`discount_value` rather than FK'ing to
+`InvoiceTemplate`: there's no equivalent "BillTemplate" model, and
+FK'ing the invoice case to `InvoiceTemplate` while the bill case had to
+embed its own spec anyway would make the two `kind`s of this one model
+asymmetric for no real benefit. `kind` (`invoice`/`bill`) determines
+whether expansion creates `Invoice` or `Bill` rows, validated against
+exactly one of `customer`/`vendor` being set
+(`RecurringTransactionSerializer.validate`).
+
+Idempotency works differently from `EmployeeShift`'s plain
+`get_or_create()`, because creating an `Invoice`/`Bill` is a multi-step
+operation (sequence number, line items, tax calculation) that doesn't fit
+a single-insert `defaults` dict. Instead: a cheap pre-check skips
+occurrences already generated, and the actual creation is wrapped in
+`transaction.atomic()` with the DB's own unique constraint
+(`unique_invoice_per_recurring_transaction_occurrence` /
+`unique_bill_per_recurring_transaction_occurrence`) as the real
+concurrency safety net — a losing concurrent attempt gets `IntegrityError`,
+caught and treated as "already handled." Same shape as
+`StripeWebhookEvent`'s insert-first idempotency. Proven directly
+(`finance.test_part2.RecurringTransactionExpansionTests.test_running_expansion_twice_does_not_duplicate`):
+running expansion twice over the same window creates the documents once,
+not twice.
+
+### AR/AP aging reports
+
+The actual fix (Phase 1 audit finding): aging reports used to load every
+invoice/bill client-side and bucket them in the browser, with no
+pagination. `finance/reports.py` computes the bucket aggregation
+server-side, from the real unpaid balance (`total - paid_total`, never a
+client-sent number) — `current`, `1_30`, `31_60`, `61_90`, `90_plus`,
+based on actual days past `due_date`. Only `sent`/`overdue` invoices (or
+`received`/`overdue` bills) with a positive remaining balance are
+included; `draft`, `paid`, and `cancelled` documents are excluded.
+
+The bucket *summary* (`GET .../reports/ar-aging/` or `.../ap-aging/`) is
+small and fixed-size by construction (5 buckets) and is never paginated.
+The underlying rows that make up one bucket can be large, though, so the
+same endpoint's `?bucket=<key>` mode returns the actual `Invoice`/`Bill`
+rows in that one bucket through real DRF pagination
+(`AgingReportDetailPagination`, 25/page) — that's the "detail view" the
+audit finding's pagination requirement is actually about; the 5-bucket
+summary itself was never the thing that needed pagination.
+`finance.test_part2.AgingReportTests` checks both the hand-calculated
+bucket categorization (known due dates at +5, -10, -45, -75, -120 days)
+and that the detail mode is genuinely paginated (`results`/`count` keys
+present), not a dump.
+
+### Endpoints
+
+**Staff-side** (`core.permissions.HasBusinessRole`, same tenant-scoping as
+every other domain):
+
+- `/api/businesses/<business_id>/accounts/` — CRUD (`ChartOfAccount`).
+- `/api/businesses/<business_id>/invoices/` — CRUD (create/update go through `InvoiceWriteSerializer` + services, never a generic `ModelSerializer.save()`); `.../send/`, `.../cancel/`, `.../record-payment/` actions.
+- `/api/businesses/<business_id>/payments/` — read-only; the only way one is created is the `record-payment` action above.
+- `/api/businesses/<business_id>/estimates/` — CRUD; `.../convert-to-invoice/` action.
+- `/api/businesses/<business_id>/invoice-templates/` — CRUD.
+- `/api/businesses/<business_id>/bills/` — CRUD; `.../receive/`, `.../cancel/`, `.../record-payment/` actions.
+- `/api/businesses/<business_id>/bill-payments/` — read-only.
+- `/api/businesses/<business_id>/bank-transactions/` — CRUD; `.../reconcile/` action.
+- `/api/businesses/<business_id>/recurring-transactions/` — CRUD.
+- `/api/businesses/<business_id>/reports/ar-aging/` and `.../ap-aging/` — bucket summary by default, `?bucket=<key>` for the paginated detail list.
+
+**Public, unauthenticated**: `POST /api/finance/webhooks/stripe/` —
+unchanged path from before this session (kept in its own `finance/webhook_urls.py`
+specifically so it didn't need to move when the staff-side routes were
+added under the usual `/api/businesses/<business_id>/...` convention).
+
 ## Security hardening notes (for when each domain is built)
 
 These are commitments made now so they aren't lost by the time the
@@ -723,6 +1049,10 @@ specific note:
   including the guest-booking permission model (separate from
   `HasBusinessRole`, rate-limiting as the primary abuse defense) and the
   `business_hours`-enumeration and floor-plan-drift fixes.
-- **Stripe webhook**: signature-verified via `STRIPE_WEBHOOK_SECRET`
+- **Stripe webhook**: **Built.** Signature-verified via `STRIPE_WEBHOOK_SECRET`
   (`finance/webhooks.py`), not authenticated via the normal JWT path since
-  Stripe can't send one.
+  Stripe can't send one. All four handlers (`checkout.session.completed`,
+  `invoice.paid`, `customer.subscription.updated`/`.deleted`) are now
+  actually implemented, not TODO stubs, and event processing is
+  idempotent (`StripeWebhookEvent`) — this was a real functional gap in
+  the old system, not a porting task. See "Finance domain" above.
