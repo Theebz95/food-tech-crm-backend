@@ -34,6 +34,16 @@ class GeofenceSettingSerializer(serializers.ModelSerializer):
         # `business` is set by the view from the URL, same pattern as
         # CustomerSerializer — never accepted from the request body.
         read_only_fields = ["id", "business", "created_at", "updated_at"]
+        # DRF's unique-together machinery sees the model's
+        # UniqueConstraint(fields=["business", "location"]) and, as a side
+        # effect, forces `location` to required=True — even though
+        # `business` is read_only here so no UniqueTogetherValidator
+        # actually gets attached (nothing is gained). Left alone, this
+        # makes the model's documented null-location "applies
+        # business-wide" case (see GeofenceSetting's docstring)
+        # unreachable through the API. Explicitly restored to match the
+        # model's own null=True/blank=True.
+        extra_kwargs = {"location": {"required": False}}
 
     def validate_location(self, location):
         business = self.context.get("business")

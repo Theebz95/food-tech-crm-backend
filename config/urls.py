@@ -12,6 +12,7 @@ urlpatterns = [
     path("api/", include("marketing.urls")),
     path("api/", include("settings.urls")),
     path("api/", include("finance.urls")),
+    path("api/", include("loyalty.urls")),
     # Public, unauthenticated routes — deliberately mounted under a
     # distinct prefix rather than alongside the HasBusinessRole routes
     # above, so it's unmistakable at the routing level which endpoints

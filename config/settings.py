@@ -142,6 +142,9 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
     ],
+    # See core/exceptions.py — only adds ProtectedError -> 400 on top of
+    # DRF's default handler; everything else is unchanged.
+    "EXCEPTION_HANDLER": "core.exceptions.exception_handler",
     "DEFAULT_THROTTLE_CLASSES": [
         "rest_framework.throttling.AnonRateThrottle",
         "rest_framework.throttling.UserRateThrottle",
@@ -257,5 +260,13 @@ CELERY_BEAT_SCHEDULE = {
     "expand-recurring-transactions": {
         "task": "finance.tasks.expand_recurring_transactions",
         "schedule": crontab(hour=2, minute=30),
+    },
+    # Replaces the old "no expiration enforcement at all" state — see
+    # loyalty/models.py "Finance domain" docstring and
+    # loyalty/services.py:expire_due_points. No-op for any business whose
+    # LoyaltyProgram leaves points_expire_after_days null (never expires).
+    "expire-points": {
+        "task": "loyalty.tasks.expire_points",
+        "schedule": crontab(hour=4, minute=0),
     },
 }

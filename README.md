@@ -7,11 +7,13 @@ staying on **Supabase Postgres**. The frontend keeps using Supabase Auth
 client-side exactly as before; this backend validates the same JWTs rather
 than replacing them.
 
-This is a foundation-only scaffold. Only the `core` app (tenancy model) and
-the cross-cutting auth/webhook infrastructure are fully built. Every other
-app is a structural placeholder with a documented plan in its `models.py`,
-to be built out one domain at a time in follow-up sessions. See "Project
-status" below for exactly what exists today.
+**Migration complete.** Every domain identified in the original Phase 1
+audit has been ported, fixed, and tested — `core`, `authentication`,
+`customers`, `employees`, `reservations`, `inventory`, `documents`,
+`marketing`, `settings`, `finance`, and `loyalty` (including Orders and
+gift cards). `loyalty` was the last domain built. See "Project status"
+below for what each app covers, and the end of "Loyalty domain" for a
+final summary of the audit findings this migration closed out.
 
 ## Local setup
 
@@ -70,7 +72,7 @@ Copy the `whsec_...` it prints into `STRIPE_WEBHOOK_SECRET` in `.env`.
 | `documents` | **Built.** File metadata + Supabase Storage (S3-compatible) integration, fixing the old upload-orphan risk with a write-ahead `pending` row. See "Documents domain" below for the chosen strategy and why. |
 | `marketing` | **Built.** Website tracking (scripts, visitors, page views, events), leads, form submissions, and Google Ads campaign metadata — a public, unauthenticated tracking beacon + form endpoint (server-side rate limited, payload-validated) alongside staff CRUD. See "Marketing domain" below, including the `script_key` threat model. |
 | `settings` | **Built.** `BusinessProfile` — logo, contact info, address, default timezone, notification preference toggles. See "Settings domain" below for which old settings tables this covers vs. where the rest already live (Employees, Reservations). |
-| `loyalty` | **Placeholder only.** `models.py` documents what's planned and which Phase 1 audit findings / Phase 2 architectural decisions it needs to address. No models, views, or URLs yet. |
+| `loyalty` | **Built — the final domain.** Orders (including the points-on-creation coupling the audit flagged), loyalty programs/accounts/points with real tier calculation and expiration, and gift cards with server-side QR generation. See "Loyalty domain" below — this completes domain coverage from the original audit. |
 
 ## The new tenancy model vs. the old one
 
@@ -142,7 +144,7 @@ Pulled directly from the Phase 1 SQL audit of the old `supabase/migrations`:
 | `is_superadmin(uuid)` / `has_role()` RPC | `User.is_superadmin` boolean + `IsSuperAdmin` DRF permission class | **Built** (`authentication/`) |
 | `sync_customer_to_portal_account()` / `sync_customer_to_portal` trigger (kept a linked portal account's name/phone in sync with the customer row) | **Moot** under unified auth — see "Customers domain" below for the full mapping | N/A |
 | Invoice/payment/bill status transitions | **No DB trigger existed for these even in the old system** — confirmed by grepping every migration; only the generic `updated_at` trigger touched those tables. All of that math was client-side. Now `finance/services.py`: `transaction.atomic()` + `select_for_update()`, never trusting a client-sent total. | **Built** (`finance/`) |
-| Gift card balance, loyalty points accrual | Same old finding (no DB trigger, client-side math) — will become service-layer functions wrapped in `transaction.atomic()` + `select_for_update()` (see `loyalty/models.py`) the same way `finance/services.py` does it | Not implemented until `loyalty` is built |
+| Gift card balance, loyalty points accrual | Same old finding (no DB trigger, client-side math). Now `loyalty/services.py`: `transaction.atomic()` + `select_for_update()`, the same way `finance/services.py` does it | **Built** (`loyalty/`) |
 | `check_expired_trials()` function + `pg_cron` daily job | `core.tasks.check_expired_trials` Celery Beat task, same three-step logic (expire -> reactivate -> re-expire), against `Business` instead of `profiles` | **Built** |
 
 ## Customers domain
@@ -1002,15 +1004,178 @@ unchanged path from before this session (kept in its own `finance/webhook_urls.p
 specifically so it didn't need to move when the staff-side routes were
 added under the usual `/api/businesses/<business_id>/...` convention).
 
+## Loyalty domain — the final domain
+
+Orders, loyalty programs/accounts/points, and gift cards. The original
+audit called this the single strongest case for backend-enforced
+transactions in the whole system — every balance mutation here reuses the
+exact same `transaction.atomic()` + `select_for_update()` pattern already
+proven in `inventory.services.adjust_stock`,
+`finance.services.record_payment`/`record_bill_payment`, and
+Reservations' table-locking, not a new approach invented for this domain.
+
+| Old (Supabase) | New (Django) | Notes |
+|---|---|---|
+| `orders` / `order_line_items` | `Order` / `OrderLineItem` (`loyalty/models.py`) | Same shape as `Invoice`/`Bill` — tax/discount calculation reuses `finance.tax.calculate_totals` directly, not a second implementation. No `tax_rate` on line items, same reasoning as `InvoiceLineItem`. |
+| `loyalty_programs` | `LoyaltyProgram` | `silver_threshold`/`gold_threshold`/`platinum_threshold` are explicit integer fields, not JSON — there are exactly 3, fixed, so a typed field per threshold is simpler and safer than an unvalidated shape. `points_expire_after_days` is optional (null = never expires, the default). |
+| `customer_loyalty_accounts` | `CustomerLoyaltyAccount` | `current_tier` is now actually computed (see "Tier calculation" below) — it existed as a field in the old system but nothing ever set it. |
+| `points_transactions` | `PointsTransaction` | Append-only, same enforcement as `inventory.InventoryTransaction`. |
+| `gift_cards` | `GiftCard` | `code` is server-generated (`secrets.token_urlsafe`), same standard as `marketing.TrackingScript.script_key` — never client-chosen, never sequential. |
+| `gift_card_transactions` | `GiftCardTransaction` | Append-only, mirrors `PointsTransaction`. |
+
+### The actual fixes (Phase 1 audit findings)
+
+1. **Points accrual/redemption was entirely client-side, non-atomic.**
+   `award_points`/`redeem_points` (`loyalty/services.py`) lock the
+   `CustomerLoyaltyAccount` row; `redeem_points` rejects outright — never
+   clamps — an amount that would take `available_points` negative.
+   Proven with a real multi-thread test
+   (`loyalty.tests.PointsRedemptionConcurrencyTests`: 100 available, two
+   concurrent redemptions of 80 each — exactly one succeeds).
+2. **Gift card balance reloads/redemptions had the same risk.**
+   `reload_gift_card`/`redeem_gift_card` mirror the points functions
+   exactly; `redeem_gift_card` additionally rejects an expired or inactive
+   card. Same concurrency proof, independently
+   (`loyalty.tests.GiftCardConcurrencyTests`).
+3. **`current_tier` existed as a field but was never computed.** See
+   "Tier calculation" below for the exact rule, now enforced inside the
+   same atomic block as every `lifetime_points` change.
+4. **No expiration enforcement existed on points or gift card balances.**
+   See "Points expiration" below for points; `GiftCard.expires_at` is
+   checked directly in `redeem_gift_card`.
+5. **QR code generation depended on an external service (QRServer.com).**
+   Replaced with the `qrcode` library, generated on demand
+   (`GET .../gift-cards/<id>/qr-code/`) — see "QR codes" below for why
+   this isn't stored as a `Document`.
+6. **Orders auto-awarded points non-atomically on creation.**
+   `create_order_and_award_points` creates the `Order` (and its line
+   items) and awards the resulting points in **one**
+   `transaction.atomic()` block — if anything fails, including inside the
+   points-awarding step, the order rolls back too. Proven directly, not
+   just inferred from the code wrapping both in one function
+   (`loyalty.tests.CreateOrderAndAwardPointsAtomicityTests.test_failure_during_points_award_rolls_back_the_order_too`):
+   a forced exception between order creation and the points award leaves
+   zero `Order`, `OrderLineItem`, or `PointsTransaction` rows — not a
+   half-applied state.
+
+### Tier calculation
+
+`current_tier` is computed from `lifetime_points` — which only ever
+increases (redemptions reduce `available_points`, never `lifetime_points`)
+— compared against `LoyaltyProgram`'s `silver_threshold`/`gold_threshold`/`platinum_threshold`.
+Chosen over lifetime *spend* because `lifetime_points` is already an
+explicit field in the data model (so the rule needs no second metric to
+track), and because a tier based on points earned rather than dollars
+spent is insulated from a `LoyaltyProgram.points_per_dollar` rate change
+silently reshuffling everyone's tier. Recalculated inside the same atomic
+block as every `lifetime_points` change (`award_points` always;
+`redeem_points` calls the same recalculation for consistency, though it's
+a no-op there since redemption never changes `lifetime_points`) — **a
+tier never drops just because points were spent**
+(`loyalty.tests.TierCalculationTests.test_tier_does_not_drop_on_redemption`).
+
+### Points expiration
+
+`LoyaltyProgram.points_expire_after_days` is optional, defaulting to
+`null` (never expires) — there is no expiration window in the original
+data model to port, so a mandatory policy isn't invented here. When set,
+each *earning* `PointsTransaction` gets its own `expires_at` at creation;
+the daily `loyalty.tasks.expire_points` Celery Beat task finds transactions
+past that date and creates a compensating row for each.
+
+**Deliberate simplification, stated plainly rather than hidden:** this
+expires *a specific grant*, capped at
+`min(original points_change, account.available_points)` — it is not true
+multi-grant FIFO lot tracking (knowing precisely which surviving points
+came from which grant after partial redemptions across multiple grants).
+It guarantees the account never goes negative and never expires more
+than that one grant earned; it does not guarantee strict
+oldest-points-first consumption order when an account has several grants
+at different ages. Building exact multi-grant reconciliation would be
+inventing policy complexity beyond what's asked for, not faithfully
+reproducing anything — the original system enforced no expiration at
+all. Idempotency (so a Beat task running twice, or two overlapping runs,
+never double-expires the same grant) works by giving the compensating row
+a FK back to the grant it expires
+(`PointsTransaction.expired_transaction`), unique-constrained — this also
+means the original earn transaction is never mutated, preserving full
+append-only immutability even for expiration. Proven directly
+(`loyalty.tests.ExpirePointsTests`, including the clamped-partial-redemption
+case and running the task twice).
+
+### QR codes
+
+Generated on demand (`loyalty/qr.py`, the `qrcode` library) rather than
+stored as a `Document` (the Documents domain's upload pattern, reused
+elsewhere in this codebase — e.g. Settings' logo). A QR code is a
+deterministic encoding of data already on the `GiftCard` row (its
+`code`); storing a rendered copy would only add cache-invalidation risk
+for an asset with no independent value of its own, unlike a business
+logo, which *is* the canonical asset. Regenerating it is cheap and always
+correct.
+
+### Gift card email — the first Resend integration in this codebase
+
+The prompt for this domain assumed an existing Resend pattern in Finance
+for invoice emails to reuse; there wasn't one — checked directly (no
+`resend`/`send_mail`/`EmailMessage`/SMTP usage anywhere in this repo
+before this domain was built). `core/email.py` (`send_email`) is the
+first one, calling Resend's REST API directly via `requests` rather than
+the `resend` SDK (one POST, one response, not worth a dependency) — built
+as shared `core` infrastructure specifically so Finance's invoice-email
+flow (still not built) has something to reuse later, the same way the
+Stripe webhook was built ahead of the rest of Finance in an earlier
+session because it was new infrastructure other code would depend on.
+
+### Endpoints
+
+All under `core.permissions.HasBusinessRole`:
+
+- `/api/businesses/<business_id>/orders/` — list/retrieve/create (`OrderWriteSerializer` + `services.create_order_and_award_points`); `.../cancel/` reverses any awarded points (clamped).
+- `/api/businesses/<business_id>/loyalty-programs/` — CRUD.
+- `/api/businesses/<business_id>/loyalty-accounts/` — CRUD (balances/tier always read-only); `.../award-points/`, `.../redeem-points/` actions.
+- `/api/businesses/<business_id>/points-transactions/` — read-only.
+- `/api/businesses/<business_id>/gift-cards/` — CRUD (create via `GiftCardCreateSerializer` + `services.create_gift_card`, balances always read-only); `.../reload/`, `.../redeem/`, `.../send/` (email), `.../qr-code/` (PNG image response) actions.
+- `/api/businesses/<business_id>/gift-card-transactions/` — read-only.
+
+### Migration complete
+
+This closes out every domain identified in the original Phase 1 audit.
+Summary of what changed, end to end, across the whole migration:
+
+- **Tenancy model**: a real `Business`/`BusinessLocation`/`BusinessMembership`
+  structure replacing the old direct-`user_id`-column-per-table pattern,
+  with one shared permission class (`HasBusinessRole`) instead of
+  per-table RLS policies.
+- **Every client-side, non-atomic balance/total/status computation** found
+  in the audit — geofencing, time tracking, payroll, reservation
+  double-booking, inventory stock, invoice/bill totals and payment
+  status, loyalty points, gift card balances — now goes through a
+  server-side service function wrapped in `transaction.atomic()` +
+  `select_for_update()`, never trusting a client-sent number.
+- **Every missing piece of backend enforcement** the audit flagged as a
+  real functional gap, not a porting task — the Stripe webhook, AR/AP
+  aging aggregation, recurring schedule/transaction expansion, points/gift-card
+  expiration — is now real, scheduled, idempotent infrastructure.
+- **Every external-service dependency the audit flagged for removal** —
+  QRServer.com (replaced with server-side `qrcode` generation) — is gone.
+- **Tenant isolation is proven, not assumed**, for every domain: each
+  one's deny-path tests were validated by deliberately breaking
+  `HasBusinessRole` (or the relevant guard) and confirming the tests
+  failed, then restoring it — the same method, applied consistently from
+  the very first domain (`employees`) through the last (`loyalty`).
+
 ## Security hardening notes (for when each domain is built)
 
 These are commitments made now so they aren't lost by the time the
 relevant app is implemented — see each placeholder `models.py` for the
 specific note:
 
-- **Loyalty/gift cards/finance**: balance and status mutations go
-  through `transaction.atomic()` + `select_for_update()` service functions.
-  No client-trusted balance math.
+- **Loyalty points / gift cards**: **Built.** `loyalty/services.py`:
+  `award_points`/`redeem_points`/`reload_gift_card`/`redeem_gift_card`,
+  all `transaction.atomic()` + `select_for_update()`, all rejecting
+  outright (never clamping) an operation that would take a balance
+  negative. No client-trusted balance math. See "Loyalty domain" above.
 - **Inventory stock adjustments**: **Built.** Every quantity change goes
   through `inventory/services.py:adjust_stock` (`transaction.atomic()` +
   `select_for_update()` on the `InventoryItem` row), which rejects an
