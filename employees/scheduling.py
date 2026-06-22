@@ -76,12 +76,16 @@ def expand_active_recurring_schedules(window_days=28) -> int:
     Rolling expansion: ensures every active RecurringSchedule has shifts
     generated through `window_days` from today. Safe to call repeatedly —
     see module docstring.
+
+    Excludes deactivated/lapsed businesses (membership__business__is_active=False)
+    — same fix, same day, same reason as finance.recurring's equivalent
+    check; see that module's docstring.
     """
     today = timezone.now().date()
     window_end = today + timedelta(days=window_days)
 
     active_schedules = RecurringSchedule.objects.filter(
-        is_active=True, start_date__lte=window_end
+        is_active=True, membership__business__is_active=True, start_date__lte=window_end
     ).filter(Q(end_date__isnull=True) | Q(end_date__gte=today)).select_related("shift_template")
 
     total_created = 0

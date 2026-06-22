@@ -13,6 +13,7 @@ from .models import (
     InvoiceTemplate,
     Payment,
     RecurringTransaction,
+    Refund,
     StripeWebhookEvent,
 )
 
@@ -45,6 +46,19 @@ class PaymentAdmin(admin.ModelAdmin):
     list_filter = ("method",)
     search_fields = ("business__name", "invoice__invoice_number", "stripe_payment_intent_id")
     autocomplete_fields = ["business", "invoice", "deposit_account", "created_by"]
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(Refund)
+class RefundAdmin(admin.ModelAdmin):
+    list_display = ("amount", "payment", "business", "created_at")
+    search_fields = ("business__name", "payment__invoice__invoice_number")
+    autocomplete_fields = ["business", "payment", "created_by"]
 
     def has_change_permission(self, request, obj=None):
         return False

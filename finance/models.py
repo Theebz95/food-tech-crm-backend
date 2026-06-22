@@ -226,6 +226,13 @@ class Invoice(models.Model):
         PAID = "paid", "Paid"
         OVERDUE = "overdue", "Overdue"
         CANCELLED = "cancelled", "Cancelled"
+        # Set only by services.record_refund, when a Refund (this app's
+        # answer to the "refunds deferred to part 2, never built" gap on
+        # Payment) brings net_paid_total to zero or below. A *partial*
+        # refund instead reverts a PAID invoice back to SENT (there's
+        # still an outstanding balance, same as before it was ever fully
+        # paid) — see record_refund's docstring for the full reasoning.
+        REFUNDED = "refunded", "Refunded"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     business = models.ForeignKey(Business, on_delete=models.CASCADE, related_name="invoices")
@@ -285,6 +292,17 @@ class Invoice(models.Model):
     def paid_total(self) -> Decimal:
         return self.payments.aggregate(total=models.Sum("amount"))["total"] or Decimal("0")
 
+    @property
+    def refunded_total(self) -> Decimal:
+        return Refund.objects.filter(payment__invoice_id=self.id).aggregate(total=models.Sum("amount"))[
+            "total"
+        ] or Decimal("0")
+
+    @property
+    def net_paid_total(self) -> Decimal:
+        """What's actually still paid, after refunds. The basis for record_refund's status recalculation."""
+        return self.paid_total - self.refunded_total
+
     def __str__(self):
         return f"{self.invoice_number} ({self.status})"
 
@@ -315,9 +333,9 @@ class InvoiceLineItem(models.Model):
 class Payment(models.Model):
     """
     Append-only, like inventory.InventoryTransaction — a financial ledger
-    entry shouldn't be editable after creation. Refunds/reversals are
-    deferred to part 2 (would be a compensating entry, not an edit to
-    this row).
+    entry shouldn't be editable after creation. Refunds/reversals are a
+    separate, equally append-only Refund row (see below) — never an edit
+    to this one.
     """
 
     class Method(models.TextChoices):
@@ -359,6 +377,55 @@ class Payment(models.Model):
 
     def __str__(self):
         return f"{self.amount} via {self.method} ({self.created_at:%Y-%m-%d})"
+
+
+class Refund(models.Model):
+    """
+    The actual fix for the gap Payment's docstring used to describe as
+    "deferred to part 2" — never built when part 2 happened (confirmed by
+    grep: zero `refund` references anywhere in this app before this).
+    A Refund is its own append-only ledger entry, same immutability
+    principle as Payment/PointsTransaction/GiftCardTransaction/
+    InventoryTransaction — never an edit or delete of the original
+    Payment, which correctly continues to reject both.
+
+    PROTECT on `payment`, not CASCADE — same reasoning applied to every
+    other ledger-references-ledger relationship audited this session
+    (loyalty.PointsTransaction.account, loyalty.GiftCardTransaction.gift_card):
+    a Payment can never actually be deleted today (it raises TypeError),
+    so this is defense in depth, not a live concern.
+
+    If a Payment/Invoice ever gets coupled to loyalty points in the
+    future (no such coupling exists today — confirmed: only
+    loyalty.Order triggers points, see the cross-domain audit), a refund
+    should be positioned to reverse those too at the point it's recorded.
+    Not built now since there's nothing to reverse yet.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    business = models.ForeignKey(Business, on_delete=models.CASCADE, related_name="refunds")
+    payment = models.ForeignKey(Payment, on_delete=models.PROTECT, related_name="refunds")
+    amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal("0.01"))])
+    reason = models.TextField(blank=True, default="")
+    created_by = models.ForeignKey(
+        BusinessMembership, on_delete=models.SET_NULL, null=True, related_name="recorded_refunds"
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def save(self, *args, **kwargs):
+        if self.pk is not None and not self._state.adding:
+            raise TypeError("Refund is append-only; existing rows cannot be modified.")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("Refund is append-only; rows cannot be deleted.")
+
+    def __str__(self):
+        return f"Refund of {self.amount} on {self.payment}"
 
 
 class Bill(models.Model):

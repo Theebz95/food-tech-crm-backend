@@ -146,6 +146,13 @@ class TimeEntry(models.Model):
     clock_in_within_geofence = models.BooleanField(null=True, blank=True)
     clock_out_within_geofence = models.BooleanField(null=True, blank=True)
 
+    # Set only by employees.services.handle_membership_deactivation, when a
+    # still-open entry gets force-closed because its membership was
+    # deactivated — distinguishes this from a real clock-out (no geofence
+    # check ever ran) so managers reviewing time records later can tell
+    # the difference. See that function's docstring.
+    auto_closed_on_deactivation = models.BooleanField(default=False)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -181,6 +188,8 @@ class TimeEntryBreak(models.Model):
     time_entry = models.ForeignKey(TimeEntry, on_delete=models.CASCADE, related_name="breaks")
     break_start_at = models.DateTimeField()
     break_end_at = models.DateTimeField(null=True, blank=True)
+    # Same marker/meaning as TimeEntry.auto_closed_on_deactivation.
+    auto_closed_on_deactivation = models.BooleanField(default=False)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -488,6 +497,11 @@ class ShiftSwapRequest(models.Model):
         PENDING = "pending", "Pending"
         APPROVED = "approved", "Approved"
         REJECTED = "rejected", "Rejected"
+        # Set only by employees.services.handle_membership_deactivation —
+        # distinct from REJECTED (a deliberate manager decision): the
+        # request became moot because the requester, or the membership
+        # they wanted to swap with, left.
+        CANCELLED = "cancelled", "Cancelled"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     shift = models.ForeignKey(EmployeeShift, on_delete=models.CASCADE, related_name="swap_requests")
@@ -530,6 +544,10 @@ class TimeOffRequest(models.Model):
         PENDING = "pending", "Pending"
         APPROVED = "approved", "Approved"
         REJECTED = "rejected", "Rejected"
+        # Set only by employees.services.handle_membership_deactivation —
+        # see ShiftSwapRequest.Status.CANCELLED for why this is distinct
+        # from REJECTED.
+        CANCELLED = "cancelled", "Cancelled"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     membership = models.ForeignKey(

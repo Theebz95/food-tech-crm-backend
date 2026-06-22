@@ -28,6 +28,17 @@ def get_membership(user, business_id):
     ).first()
 
 
+def _business_is_active(business_id):
+    """
+    Business.is_active is written correctly (core.tasks.check_expired_trials,
+    finance.webhooks' Stripe handler) but, before this check existed, was
+    read by nothing — a deactivated/lapsed business's staff retained full
+    API access regardless. This is the fix: every business-scoped request,
+    not just the two writers, now respects the flag.
+    """
+    return Business.objects.filter(id=business_id, is_active=True).exists()
+
+
 class HasBusinessRole(BasePermission):
     """
     Tenant-scoped permission for DRF views.
@@ -70,7 +81,9 @@ class HasBusinessRole(BasePermission):
         membership = get_membership(request.user, business_id)
         if membership is not None:
             request.business_membership = membership
-        return self._role_is_sufficient(membership, view)
+        if not self._role_is_sufficient(membership, view):
+            return False
+        return _business_is_active(business_id)
 
     def has_object_permission(self, request, view, obj):
         if getattr(request.user, "is_superadmin", False):
@@ -83,7 +96,9 @@ class HasBusinessRole(BasePermission):
             return False
 
         membership = get_membership(request.user, business_id)
-        return self._role_is_sufficient(membership, view)
+        if not self._role_is_sufficient(membership, view):
+            return False
+        return _business_is_active(business_id)
 
 
 class IsBusinessManager(HasBusinessRole):

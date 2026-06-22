@@ -27,6 +27,7 @@ from .models import (
     InvoiceTemplate,
     Payment,
     RecurringTransaction,
+    Refund,
 )
 from .reports import AGING_BUCKETS
 from .serializers import (
@@ -44,7 +45,9 @@ from .serializers import (
     ReconcileBankTransactionSerializer,
     RecordBillPaymentSerializer,
     RecordPaymentSerializer,
+    RecordRefundSerializer,
     RecurringTransactionSerializer,
+    RefundSerializer,
 )
 
 
@@ -112,7 +115,7 @@ class InvoiceTemplateViewSet(_BusinessScopedViewSet):
 
 
 class PaymentViewSet(viewsets.ReadOnlyModelViewSet):
-    """Read-only — the only way a Payment gets created is InvoiceViewSet.record_payment."""
+    """Read-only except for the dedicated refund action — Payment.delete()/save() on an existing row both still raise."""
 
     serializer_class = PaymentSerializer
     permission_classes = [HasBusinessRole]
@@ -120,6 +123,38 @@ class PaymentViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         return Payment.objects.filter(business_id=self.kwargs["business_id"])
+
+    @action(detail=True, methods=["post"])
+    def refund(self, request, business_id=None, pk=None):
+        payment = self.get_object()
+        input_serializer = RecordRefundSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        data = input_serializer.validated_data
+        try:
+            refund = services.record_refund(
+                payment,
+                amount=data["amount"],
+                reason=data.get("reason", ""),
+                membership=getattr(request, "business_membership", None),
+            )
+        except services.FinanceError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        payment.invoice.refresh_from_db()
+        return Response(
+            {"refund": RefundSerializer(refund).data, "invoice": InvoiceSerializer(payment.invoice).data},
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class RefundViewSet(viewsets.ReadOnlyModelViewSet):
+    """Read-only — the only way a Refund gets created is PaymentViewSet.refund."""
+
+    serializer_class = RefundSerializer
+    permission_classes = [HasBusinessRole]
+    business_lookup_url_kwarg = "business_id"
+
+    def get_queryset(self):
+        return Refund.objects.filter(business_id=self.kwargs["business_id"])
 
 
 class BillPaymentViewSet(viewsets.ReadOnlyModelViewSet):

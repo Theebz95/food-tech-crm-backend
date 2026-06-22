@@ -16,6 +16,7 @@ it, a paid-when-covered status) — see record_bill_payment.
 from decimal import Decimal
 
 from django.db import transaction
+from django.db.models import Sum
 from django.utils import timezone
 
 from .models import (
@@ -31,6 +32,7 @@ from .models import (
     InvoiceLineItem,
     InvoiceNumberSequence,
     Payment,
+    Refund,
 )
 from .tax import TaxLineItem, calculate_totals
 
@@ -62,6 +64,20 @@ class OverpaymentError(FinanceError):
 
 class InvalidEstimateStateError(FinanceError):
     pass
+
+
+class RefundError(FinanceError):
+    pass
+
+
+class OverRefundError(RefundError):
+    def __init__(self, amount, already_refunded, payment_amount):
+        self.amount = amount
+        self.already_refunded = already_refunded
+        self.payment_amount = payment_amount
+        super().__init__(
+            f"Cannot refund {amount}; {already_refunded} of {payment_amount} on this payment is already refunded."
+        )
 
 
 def _generate_number(sequence_model, business, prefix) -> str:
@@ -230,6 +246,64 @@ def record_payment(invoice: Invoice, amount, method, membership=None, stripe_pay
             locked_invoice.save(update_fields=["status", "updated_at"])
 
         return payment
+
+
+def record_refund(payment: Payment, amount, reason="", membership=None) -> Refund:
+    """
+    The actual fix for the "refunds deferred to part 2, never built" gap
+    documented on Payment/Refund. A Refund is its own append-only ledger
+    entry — never an edit to the original Payment, which keeps rejecting
+    both .save() on an existing row and .delete() outright.
+
+    Locks the parent Invoice (not the Payment — Payment is already
+    immutable; Invoice.status is the thing actually being mutated here),
+    so concurrent refund attempts against the same invoice — even against
+    different payments on it — serialize correctly through the same lock.
+    The refundable amount is checked per-Payment (amount already refunded
+    against *this* payment, via its own `refunds` — Refund FKs to Payment,
+    not Invoice, so that's the natural unit), exactly mirroring how
+    record_payment rejects an overpayment against the invoice total.
+
+    Status recalculation: a refund that brings the invoice's net_paid_total
+    (paid minus all refunds) to zero or below moves it to REFUNDED. A
+    *partial* refund on a PAID invoice — net_paid_total still positive,
+    but now less than the invoice total — reverts it to SENT: there's an
+    outstanding balance again, the same state it would be in had it never
+    been fully paid. Any other status is left alone (e.g. refunding against
+    an invoice that's already REFUNDED, if somehow more than one payment
+    contributed, doesn't move it anywhere else).
+
+    No loyalty coupling to reverse: confirmed (see the cross-domain audit)
+    that no Invoice/Payment ever triggers loyalty points today — only
+    loyalty.Order does. If that ever changes, this is where the reversal
+    would need to happen too.
+    """
+    if amount <= 0:
+        raise RefundError("record_refund amount must be positive.")
+    if payment.invoice_id is None:
+        raise RefundError("Cannot refund a payment that isn't linked to an invoice.")
+
+    with transaction.atomic():
+        locked_invoice = Invoice.objects.select_for_update().get(pk=payment.invoice_id)
+
+        already_refunded = payment.refunds.aggregate(total=Sum("amount"))["total"] or Decimal("0")
+        refundable = payment.amount - already_refunded
+        if amount > refundable:
+            raise OverRefundError(amount, already_refunded, payment.amount)
+
+        refund = Refund.objects.create(
+            business=locked_invoice.business, payment=payment, amount=amount, reason=reason, created_by=membership
+        )
+
+        net_paid = locked_invoice.net_paid_total
+        if net_paid <= 0:
+            locked_invoice.status = Invoice.Status.REFUNDED
+            locked_invoice.save(update_fields=["status", "updated_at"])
+        elif locked_invoice.status == Invoice.Status.PAID and net_paid < locked_invoice.total:
+            locked_invoice.status = Invoice.Status.SENT
+            locked_invoice.save(update_fields=["status", "updated_at"])
+
+        return refund
 
 
 def create_bill(

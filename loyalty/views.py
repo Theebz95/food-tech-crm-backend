@@ -14,6 +14,7 @@ from rest_framework.response import Response
 from core.email import EmailSendError
 from core.models import Business
 from core.permissions import HasBusinessRole, business_ids_for_user
+from finance.serializers import InvoiceSerializer
 
 from . import services
 from .models import CustomerLoyaltyAccount, GiftCard, GiftCardTransaction, LoyaltyProgram, Order, PointsTransaction
@@ -195,6 +196,16 @@ class OrderViewSet(viewsets.ModelViewSet):
         except services.InvalidOrderStateError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(OrderSerializer(order).data)
+
+    @action(detail=True, methods=["post"], url_path="convert-to-invoice")
+    def convert_to_invoice(self, request, business_id=None, pk=None):
+        order = self.get_object()
+        due_date = request.data.get("due_date")
+        try:
+            invoice = services.convert_order_to_invoice(order, due_date=due_date)
+        except services.LoyaltyError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(InvoiceSerializer(invoice).data, status=status.HTTP_201_CREATED)
 
 
 class GiftCardViewSet(_BusinessScopedViewSet):

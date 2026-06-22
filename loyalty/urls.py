@@ -27,6 +27,7 @@ points_transaction_detail = PointsTransactionViewSet.as_view({"get": "retrieve"}
 order_list = OrderViewSet.as_view({"get": "list", "post": "create"})
 order_detail = OrderViewSet.as_view({"get": "retrieve"})
 order_cancel = OrderViewSet.as_view({"post": "cancel"})
+order_convert_to_invoice = OrderViewSet.as_view({"post": "convert_to_invoice"})
 
 gift_card_list = GiftCardViewSet.as_view({"get": "list", "post": "create"})
 gift_card_detail = GiftCardViewSet.as_view(
@@ -64,6 +65,11 @@ urlpatterns = [
     path("businesses/<uuid:business_id>/orders/", order_list, name="order-list"),
     path("businesses/<uuid:business_id>/orders/<uuid:pk>/", order_detail, name="order-detail"),
     path("businesses/<uuid:business_id>/orders/<uuid:pk>/cancel/", order_cancel, name="order-cancel"),
+    path(
+        "businesses/<uuid:business_id>/orders/<uuid:pk>/convert-to-invoice/",
+        order_convert_to_invoice,
+        name="order-convert-to-invoice",
+    ),
     path("businesses/<uuid:business_id>/gift-cards/", gift_card_list, name="gift-card-list"),
     path("businesses/<uuid:business_id>/gift-cards/<uuid:pk>/", gift_card_detail, name="gift-card-detail"),
     path("businesses/<uuid:business_id>/gift-cards/<uuid:pk>/reload/", gift_card_reload, name="gift-card-reload"),

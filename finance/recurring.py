@@ -100,13 +100,19 @@ def expand_active_recurring_transactions(window_days=28) -> int:
     Rolling expansion: ensures every active RecurringTransaction has
     Invoice/Bill rows generated through `window_days` from today. Safe to
     call repeatedly — see module docstring.
+
+    Excludes deactivated/lapsed businesses (business__is_active=False) —
+    before this, RecurringTransaction.is_active was the only flag checked,
+    so a business whose subscription lapsed kept generating new
+    Invoices/Bills forever. See core.permissions.HasBusinessRole, fixed
+    the same day for the same reason.
     """
     today = timezone.now().date()
     window_end = today + timedelta(days=window_days)
 
-    active = RecurringTransaction.objects.filter(is_active=True, start_date__lte=window_end).filter(
-        Q(end_date__isnull=True) | Q(end_date__gte=today)
-    )
+    active = RecurringTransaction.objects.filter(
+        is_active=True, business__is_active=True, start_date__lte=window_end
+    ).filter(Q(end_date__isnull=True) | Q(end_date__gte=today))
 
     total_created = 0
     for recurring_transaction in active:

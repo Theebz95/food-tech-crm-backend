@@ -21,6 +21,17 @@ class BusinessAdmin(admin.ModelAdmin):
     search_fields = ("name", "owner__email")
     inlines = [BusinessLocationInline, BusinessMembershipInline]
 
+    def has_delete_permission(self, request, obj=None):
+        # Business is intentionally non-deletable everywhere — see
+        # README "Business is permanent" and core/models.py. Every domain
+        # table CASCADEs from Business, so a hard delete would silently
+        # destroy financial/payroll/audit history this codebase was
+        # otherwise built specifically to protect (append-only ledgers,
+        # PROTECT'd Customer/Vendor FKs, etc. — all bypassed at once by
+        # deleting the tenant itself). Deactivate (is_active=False)
+        # instead; there is no supported path to actually delete one.
+        return False
+
 
 @admin.register(BusinessLocation)
 class BusinessLocationAdmin(admin.ModelAdmin):

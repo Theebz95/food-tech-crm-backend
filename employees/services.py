@@ -25,6 +25,7 @@ from decimal import Decimal
 from typing import Optional
 
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from core.models import BusinessMembership
@@ -346,3 +347,53 @@ def reject_time_off(time_off_request: TimeOffRequest, approving_membership: Busi
         locked.approved_by = approving_membership
         locked.save(update_fields=["status", "approved_by", "updated_at"])
         return locked
+
+
+def handle_membership_deactivation(membership: BusinessMembership) -> None:
+    """
+    Auto-resolves everything left dangling when a BusinessMembership is
+    deactivated — wired up via employees/signals.py (post_save on
+    BusinessMembership, only on an is_active True->False transition), so
+    this fires regardless of how deactivation happens: Django admin, a
+    future API endpoint, or a one-off script. Idempotent by construction
+    (every query below only ever touches still-open/still-pending rows),
+    so re-running it against an already-deactivated membership is a no-op.
+
+    - Any open TimeEntry is force-closed: clock_out_at = now(),
+      auto_closed_on_deactivation = True. No geofence check runs (there's
+      no client-reported location for an action nobody took) — this is
+      explicitly not a real clock-out, which is exactly what the marker
+      is for.
+    - Any open TimeEntryBreak on that entry is force-closed the same way.
+    - Any PENDING ShiftSwapRequest where this membership is the requester
+      is CANCELLED (not REJECTED — nobody made a decision, the request
+      just became moot).
+    - Any PENDING ShiftSwapRequest where this membership is the *target*
+      (someone wanted to swap with them) is also CANCELLED — the swap
+      can't happen either way now.
+    - Any PENDING TimeOffRequest by this membership is CANCELLED.
+    """
+    now = timezone.now()
+    with transaction.atomic():
+        # select_for_update() here because the rows get *read* (iterated)
+        # before being updated, to find their breaks — the plain bulk
+        # .update() calls below need no explicit lock of their own: an
+        # UPDATE statement's WHERE-matched rows are already row-locked by
+        # Postgres as part of the statement itself.
+        open_entries = list(
+            TimeEntry.objects.select_for_update().filter(membership=membership, status=TimeEntry.Status.CLOCKED_IN)
+        )
+        TimeEntryBreak.objects.filter(time_entry__in=open_entries, break_end_at__isnull=True).update(
+            break_end_at=now, auto_closed_on_deactivation=True, updated_at=now
+        )
+        TimeEntry.objects.filter(pk__in=[e.pk for e in open_entries]).update(
+            clock_out_at=now, status=TimeEntry.Status.CLOCKED_OUT, auto_closed_on_deactivation=True, updated_at=now
+        )
+
+        ShiftSwapRequest.objects.filter(status=ShiftSwapRequest.Status.PENDING).filter(
+            Q(requesting_membership=membership) | Q(target_membership=membership)
+        ).update(status=ShiftSwapRequest.Status.CANCELLED, updated_at=now)
+
+        TimeOffRequest.objects.filter(membership=membership, status=TimeOffRequest.Status.PENDING).update(
+            status=TimeOffRequest.Status.CANCELLED, updated_at=now
+        )

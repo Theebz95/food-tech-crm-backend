@@ -31,6 +31,7 @@ from .models import (
     InvoiceTemplate,
     Payment,
     RecurringTransaction,
+    Refund,
 )
 from .tax import DiscountType, TaxType
 
@@ -93,6 +94,8 @@ class InvoiceSerializer(serializers.ModelSerializer):
 
     line_items = InvoiceLineItemSerializer(many=True, read_only=True)
     paid_total = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    refunded_total = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    net_paid_total = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
 
     class Meta:
         model = Invoice
@@ -116,6 +119,8 @@ class InvoiceSerializer(serializers.ModelSerializer):
             "notes",
             "line_items",
             "paid_total",
+            "refunded_total",
+            "net_paid_total",
             "created_at",
             "updated_at",
         ]
@@ -176,6 +181,18 @@ class PaymentSerializer(serializers.ModelSerializer):
             "created_by",
             "created_at",
         ]
+        read_only_fields = fields
+
+
+class RecordRefundSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0.01"))
+    reason = serializers.CharField(required=False, allow_blank=True)
+
+
+class RefundSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Refund
+        fields = ["id", "business", "payment", "amount", "reason", "created_by", "created_at"]
         read_only_fields = fields
 
 

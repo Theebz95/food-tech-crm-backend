@@ -60,6 +60,7 @@ class OrderSerializer(serializers.ModelSerializer):
             "id",
             "business",
             "customer",
+            "invoice",
             "discount_type",
             "discount_value",
             "tax_type",

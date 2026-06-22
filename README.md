@@ -107,6 +107,35 @@ Every domain table that used to have a direct `user_id` FK (reservations,
 customers, employees, invoices, inventory_items, etc.) will instead FK to
 `Business` (and optionally `BusinessLocation`) when those apps are built.
 
+### Business is permanent — there is no delete, only deactivate
+
+Every domain table CASCADEs from `Business`, directly or via
+`BusinessLocation`/`BusinessMembership` — that's by design (see above),
+but it means a hard delete of a `Business` row would silently destroy
+*everything* for that tenant in one shot: every Invoice/Payment/Bill,
+every PayStub, every loyalty PointsTransaction/GiftCard, all of it —
+bypassing every append-only-ledger protection built throughout this
+project at once, since a CASCADE delete is a bulk SQL operation that
+never goes through any model's own `.delete()` override.
+
+A cross-domain audit found this was already only reachable through
+Django admin (no API endpoint for `Business` has ever existed — there's
+no `core/urls.py`/`core/views.py`), but admin alone could still do it.
+Fixed: `core.admin.BusinessAdmin.has_delete_permission` now always
+returns `False`. **There is no supported path to delete a `Business`,
+anywhere** — `is_active=False` (already wired through
+`core.tasks.check_expired_trials` and the Stripe webhook) is the only
+lever, and now actually does something: `core.permissions.HasBusinessRole`
+denies every business-scoped request once `Business.is_active` is
+`False` (previously the flag was written by those two places and read by
+nothing — see "Security hardening notes" below), and the recurring
+expansion tasks (`finance.recurring`, `employees.scheduling`) skip
+deactivated businesses too.
+
+(Direct database/Django-shell access can still always delete anything —
+no application-layer guard can prevent that. The guarantee here is about
+every supported, intentional path: the admin UI and the API.)
+
 ## Auth model
 
 One unified path: the frontend keeps using **Supabase Auth** client-side
@@ -268,6 +297,50 @@ availability/swap-request/time-off-request creation; see
 - `/api/businesses/<business_id>/shifts/` — visible to the whole team; create/update/delete and `.../<id>/set-status/` are manager+ only.
 - `/api/businesses/<business_id>/shift-swap-requests/` — any member can request a swap on their own shift; `.../<id>/approve/` and `.../reject/` are manager+ only. An open request (no `target_membership`) can be resolved at approval time via `{"target_membership_id": ...}`.
 - `/api/businesses/<business_id>/time-off-requests/` — any member can request their own; `.../<id>/approve/` and `.../reject/` are manager+ only.
+
+### Membership offboarding: deactivation auto-resolves everything dangling
+
+A cross-domain audit found that deactivating a `BusinessMembership`
+(an employee leaving) left a real gap: an open `TimeEntry` stayed clocked
+in forever, and pending `ShiftSwapRequest`/`TimeOffRequest` rows just sat
+there, unresolved, indefinitely. Decision: deactivation now auto-resolves
+all of it, via `employees/signals.py` (`post_save` on
+`core.models.BusinessMembership`, firing only on a real
+`is_active` `True -> False` transition — not on every save of an
+already-inactive row, and not on creation) calling
+`employees.services.handle_membership_deactivation`:
+
+- Any open `TimeEntry` is force-closed: `clock_out_at = now()`,
+  `auto_closed_on_deactivation = True`. No geofence check runs (there's no
+  client-reported location for an action nobody took) — this is
+  deliberately distinguishable from a real clock-out, both in the data
+  (no `clock_out_lat`/`clock_out_within_geofence`) and via the marker
+  field itself, so a manager reviewing time records later can tell the
+  difference.
+- Any open `TimeEntryBreak` on that entry is force-closed the same way,
+  with the same marker.
+- Any `PENDING` `ShiftSwapRequest` where this membership is the requester
+  *or* the target (someone wanted to swap with them) is set to a new
+  `CANCELLED` status — deliberately distinct from `REJECTED` (a manager
+  decision); nobody decided anything here, the request just became moot.
+- Any `PENDING` `TimeOffRequest` by this membership is `CANCELLED` the
+  same way.
+
+This lives in `employees/signals.py` rather than `core/`, on purpose:
+`core.models.BusinessMembership` shouldn't need to know `employees`
+exists — `employees` is the domain that cares about this side effect, so
+it's the one connecting to `core`'s model, the standard Django pattern
+for one app reacting to another's. Fires regardless of how deactivation
+happens (Django admin, a future API endpoint, a one-off script), since
+all of them go through `BusinessMembership.save()`.
+
+Deliberately **not** built (flagged as a separate, larger decision, not
+bundled into this fix): `PayStub`/`TimeEntry`/`EmployeeShift` still
+`CASCADE` from `BusinessMembership` — deleting a membership row outright
+(not just deactivating it) would still wipe payroll/time-tracking
+history. Payroll retention is its own legal question, not a judgment
+call to make implicitly while fixing the deactivation gap above — see
+"Security hardening notes" below.
 
 ### Pay stubs
 
@@ -771,7 +844,8 @@ reports.
 |---|---|---|
 | `invoices` | `Invoice` (`finance/models.py`) | FK'd to `Business` and `Customer` (`PROTECT` — a customer with invoice history can't be deleted, only deactivated). `invoice_number` is server-generated and unique per business (`InvoiceNumberSequence`, locked/incremented in the same transaction as the invoice — never `Business` itself, to avoid contending with unrelated operations elsewhere that also touch that row). |
 | `invoice_line_items` | `InvoiceLineItem` | **No `tax_rate` field** — see "Tax calculation" below for why; the real source applies one tax type to the whole document, not per line. |
-| `payments` | `Payment` | FK'd to `Business` and optionally `Invoice` (nullable — a standalone payment not tied to one). Append-only, same enforcement as `inventory.InventoryTransaction` (`save()`/`delete()` raise on an existing row). Refunds/reversals aren't built (would be a compensating entry, not an edit to this row). |
+| `payments` | `Payment` | FK'd to `Business` and optionally `Invoice` (nullable — a standalone payment not tied to one). Append-only, same enforcement as `inventory.InventoryTransaction` (`save()`/`delete()` raise on an existing row). Refunds are a separate model, `Refund` — see "Refunds" below. |
+| *(no old equivalent)* | `Refund` | New — see "Refunds" below. The actual fix for a gap this domain's `Payment` docstring used to describe as "deferred to part 2," never built when part 2 happened. |
 | `estimates` / `estimate_line_items` | `Estimate` / `EstimateLineItem` | Same shape as `Invoice`/`InvoiceLineItem`. `.../convert-to-invoice/` creates a real `Invoice` from one and locks it against re-conversion (`Estimate.status = converted`). |
 | `invoice_templates` | `InvoiceTemplate` | `line_item_presets` is plain JSON — it's only ever a pre-fill default; applying one copies its presets into real, validated `InvoiceLineItem` rows on the invoice actually being created. |
 | `chart_of_accounts` | `ChartOfAccount` | **Minimal version** — `name`/`code`/`account_type`, just enough for `Invoice.revenue_account`/`Payment.deposit_account`/`Bill.expense_account`/`BillPayment.payment_account` to optionally reference one. Hierarchical accounts, balances, and journal entries were never requested and aren't built. |
@@ -838,6 +912,51 @@ computed ad hoc, client-side. Now:
   invoices are left alone.
 - `draft -> sent` and any-non-`paid` `-> cancelled` are explicit actions
   (`.../send/`, `.../cancel/`); nothing else writes `status` directly.
+- `refunded` is set **only** by `finance/services.py:record_refund` — see
+  "Refunds" immediately below.
+
+### Refunds
+
+A cross-domain audit found that `Payment`'s own docstring described
+refunds as "deferred to part 2" — but part 2 happened, and they were
+never actually built. Closed: `Refund` (FK to `Payment`, `PROTECT` not
+`CASCADE` — same reasoning applied to every other ledger-references-ledger
+relationship audited that same session) is its own append-only ledger
+entry, same immutability principle as `Payment` itself — **never** an
+edit to the original `Payment`, which keeps rejecting both `.save()` on
+an existing row and `.delete()` outright.
+
+`record_refund(payment, amount, reason, membership)`: locks the parent
+`Invoice` (not the `Payment` — that's already immutable; `Invoice.status`
+is the thing actually being mutated), so concurrent refunds against the
+same invoice — even against different payments on it — serialize
+correctly through the same lock. The refundable amount is checked
+per-`Payment` (amount already refunded against *that* payment, since
+`Refund` FKs to `Payment`, not `Invoice` — the natural unit), mirroring
+exactly how `record_payment` rejects an overpayment against the invoice
+total. Proven with the same real multi-thread pattern used everywhere
+else in this project (`finance.test_refunds.RefundConcurrencyTests`: two
+concurrent refund attempts for the full paid amount — exactly one
+succeeds).
+
+**Status recalculation rule** (decided and documented here, since the
+old system had nothing to port): a refund that brings the invoice's
+`net_paid_total` (`paid_total` minus all refunds) to zero or below moves
+it to the new `Invoice.Status.REFUNDED`. A *partial* refund on a `paid`
+invoice — `net_paid_total` still positive, but now less than the invoice
+total — reverts it to `sent`: there's an outstanding balance again, the
+same state it would've been in had it never been fully paid. Any other
+status is left alone.
+
+No loyalty-points reversal happens on refund — confirmed (see the
+cross-domain audit) that no `Invoice`/`Payment` ever triggers loyalty
+points today; only `loyalty.Order` does. `record_refund`'s docstring
+notes this as the place a reversal would need to happen if that coupling
+is ever added later — not built now since there's nothing to reverse.
+
+Endpoint: `POST .../payments/<id>/refund/` (not generic `PATCH`/`DELETE`
+— `Payment.delete()` correctly still raises); `.../refunds/` is
+read-only, mirroring `.../payments/`.
 
 ### The Stripe webhook — a real functional gap, now closed
 
@@ -990,7 +1109,8 @@ every other domain):
 
 - `/api/businesses/<business_id>/accounts/` — CRUD (`ChartOfAccount`).
 - `/api/businesses/<business_id>/invoices/` — CRUD (create/update go through `InvoiceWriteSerializer` + services, never a generic `ModelSerializer.save()`); `.../send/`, `.../cancel/`, `.../record-payment/` actions.
-- `/api/businesses/<business_id>/payments/` — read-only; the only way one is created is the `record-payment` action above.
+- `/api/businesses/<business_id>/payments/` — read-only; the only way one is created is the `record-payment` action above; `.../refund/` action (see "Refunds").
+- `/api/businesses/<business_id>/refunds/` — read-only; the only way one is created is the `refund` action above.
 - `/api/businesses/<business_id>/estimates/` — CRUD; `.../convert-to-invoice/` action.
 - `/api/businesses/<business_id>/invoice-templates/` — CRUD.
 - `/api/businesses/<business_id>/bills/` — CRUD; `.../receive/`, `.../cancel/`, `.../record-payment/` actions.
@@ -1016,7 +1136,7 @@ Reservations' table-locking, not a new approach invented for this domain.
 
 | Old (Supabase) | New (Django) | Notes |
 |---|---|---|
-| `orders` / `order_line_items` | `Order` / `OrderLineItem` (`loyalty/models.py`) | Same shape as `Invoice`/`Bill` — tax/discount calculation reuses `finance.tax.calculate_totals` directly, not a second implementation. No `tax_rate` on line items, same reasoning as `InvoiceLineItem`. |
+| `orders` / `order_line_items` | `Order` / `OrderLineItem` (`loyalty/models.py`) | Same shape as `Invoice`/`Bill` — tax/discount calculation reuses `finance.tax.calculate_totals` directly, not a second implementation. No `tax_rate` on line items, same reasoning as `InvoiceLineItem`. Nullable `invoice` FK — see "Order/Invoice conversion" below. |
 | `loyalty_programs` | `LoyaltyProgram` | `silver_threshold`/`gold_threshold`/`platinum_threshold` are explicit integer fields, not JSON — there are exactly 3, fixed, so a typed field per threshold is simpler and safer than an unvalidated shape. `points_expire_after_days` is optional (null = never expires, the default). |
 | `customer_loyalty_accounts` | `CustomerLoyaltyAccount` | `current_tier` is now actually computed (see "Tier calculation" below) — it existed as a field in the old system but nothing ever set it. |
 | `points_transactions` | `PointsTransaction` | Append-only, same enforcement as `inventory.InventoryTransaction`. |
@@ -1057,6 +1177,39 @@ Reservations' table-locking, not a new approach invented for this domain.
    a forced exception between order creation and the points award leaves
    zero `Order`, `OrderLineItem`, or `PointsTransaction` rows — not a
    half-applied state.
+
+### Order/Invoice conversion
+
+A cross-domain audit flagged that `Order` and `Invoice` had zero
+relationship to each other — two entirely separate revenue-recording
+paths, which may have been intentional (POS-style instant sale vs. billed
+sale) or an oversight. Decision: they're linkable, not permanently
+separate. `Order.invoice` is a nullable FK (`SET_NULL` — deleting the
+`Invoice` shouldn't delete or block deleting the real sale record that
+generated it); `services.convert_order_to_invoice(order, due_date=None)`
+builds a real `Invoice` from the order's existing line items via
+`finance.services.create_invoice` directly (never reimplementing invoice
+creation) and links the two — mirroring
+`finance.services.convert_estimate_to_invoice` exactly, including the
+same `select_for_update`-then-recheck double-guard against double
+conversion (proven with the same real multi-thread pattern used
+everywhere else: `loyalty.test_order_invoice_conversion.ConvertOrderToInvoiceConcurrencyTests`).
+
+**Once converted, Order and Invoice are independent.** Cancelling the
+Order (`services.cancel_order`) only ever reverses the points it
+awarded — it never touches the linked Invoice's status. The Invoice has
+its own state machine and its own rules (a paid invoice can't be
+cancelled via `finance.services.cancel_invoice` either); an Order being
+cancelled after conversion doesn't retroactively erase a billing
+obligation, and silently cancelling a possibly-already-paid Invoice out
+from under the customer would be far more surprising than leaving the
+two independent once linked. The link (`order.invoice`) stays in place
+either way, for traceability.
+
+A cancelled Order can't be converted (`InvalidOrderStateError`); an
+already-converted Order can't be converted again
+(`OrderAlreadyConvertedError`). Endpoint:
+`POST .../orders/<id>/convert-to-invoice/`.
 
 ### Tier calculation
 
@@ -1131,7 +1284,7 @@ session because it was new infrastructure other code would depend on.
 
 All under `core.permissions.HasBusinessRole`:
 
-- `/api/businesses/<business_id>/orders/` — list/retrieve/create (`OrderWriteSerializer` + `services.create_order_and_award_points`); `.../cancel/` reverses any awarded points (clamped).
+- `/api/businesses/<business_id>/orders/` — list/retrieve/create (`OrderWriteSerializer` + `services.create_order_and_award_points`); `.../cancel/` reverses any awarded points (clamped); `.../convert-to-invoice/` creates and links a real `Invoice` (see "Order/Invoice conversion").
 - `/api/businesses/<business_id>/loyalty-programs/` — CRUD.
 - `/api/businesses/<business_id>/loyalty-accounts/` — CRUD (balances/tier always read-only); `.../award-points/`, `.../redeem-points/` actions.
 - `/api/businesses/<business_id>/points-transactions/` — read-only.
@@ -1164,6 +1317,23 @@ Summary of what changed, end to end, across the whole migration:
   `HasBusinessRole` (or the relevant guard) and confirming the tests
   failed, then restoring it — the same method, applied consistently from
   the very first domain (`employees`) through the last (`loyalty`).
+
+**Follow-up cross-domain hardening pass** (after every domain above was
+individually complete): a systematic audit of the *interactions between*
+domains — order cancellation, customer deletion, membership offboarding,
+payment refunds, recurring generation against a lapsed subscription, and
+a full `on_delete` sweep — found and closed several real gaps that no
+single domain's own test suite could have caught: `Business` is now
+truly non-deletable and `is_active` is now actually enforced everywhere
+(see "Business is permanent" above), `Order`/`Invoice` are now linkable
+(see "Order/Invoice conversion" above), membership deactivation now
+auto-resolves dangling time entries and requests (see "Membership
+offboarding" above), refunds are now real (see "Refunds" above), and a
+`CustomerLoyaltyAccount.customer` `CASCADE` that contradicted every other
+Customer-FK'd ledger model's `PROTECT` choice was fixed directly, along
+with a previously-unhandled `ProtectedError` (`core/exceptions.py`) that
+meant even the *already-correct* `PROTECT` relations were surfacing as
+raw 500s instead of clean 400s.
 
 ## Security hardening notes (for when each domain is built)
 
@@ -1221,3 +1391,29 @@ specific note:
   actually implemented, not TODO stubs, and event processing is
   idempotent (`StripeWebhookEvent`) — this was a real functional gap in
   the old system, not a porting task. See "Finance domain" above.
+- **`Business.is_active` enforcement**: **Built** (cross-domain hardening
+  pass, after every domain above was individually complete). The flag was
+  written correctly by `core.tasks.check_expired_trials` and the Stripe
+  webhook from the start, but read by nothing — a deactivated/lapsed
+  business's staff retained full API access, and the recurring expansion
+  tasks kept generating new work for it forever. `HasBusinessRole` now
+  denies every business-scoped request once it's `False`; the expansion
+  tasks now skip it too. See "Business is permanent" above.
+
+### Explicitly deferred (flagged during the cross-domain audit, not built)
+
+These are real gaps, named and left open on purpose, pending an explicit
+decision rather than an implicit one made while fixing something else:
+
+- **`PayStub`/`TimeEntry`/`EmployeeShift` `CASCADE` from `BusinessMembership`**:
+  deleting a membership row outright (not just deactivating it) still
+  wipes payroll/time-tracking history. Payroll retention is a legal
+  question, not an engineering judgment call — see "Membership
+  offboarding" above.
+- **`RecurringTransaction.customer`/`.vendor` are `CASCADE`** while
+  `Invoice.customer`/`Bill.vendor` (the documents actually generated from
+  them) are `PROTECT`. Lower severity — `RecurringTransaction` is a
+  future-billing template, not itself a ledger, and any already-generated
+  Invoice/Bill already protects the Customer/Vendor independently — but
+  still an inconsistency worth a deliberate decision rather than leaving
+  unexamined.

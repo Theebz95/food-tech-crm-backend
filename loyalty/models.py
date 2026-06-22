@@ -89,6 +89,18 @@ class Order(models.Model):
     # PROTECT — same reasoning as Invoice.customer/Bill.vendor: an order is
     # a financial record, not something to lose the link to.
     customer = models.ForeignKey(Customer, on_delete=models.PROTECT, related_name="orders")
+    # An Order can exist on its own (POS-style instant sale) OR later be
+    # converted into a billed Invoice via services.convert_order_to_invoice
+    # — see that function's docstring for the deliberate choice that Order
+    # and Invoice become fully independent once linked (cancelling the
+    # Order only ever reverses its own points; it never touches an
+    # already-issued Invoice's status, which has its own state machine and
+    # its own rules — e.g. a paid invoice can't be cancelled either).
+    # SET_NULL, not CASCADE/PROTECT: deleting the Invoice shouldn't delete
+    # or block deleting the real sale record (the Order) that generated it.
+    invoice = models.ForeignKey(
+        "finance.Invoice", on_delete=models.SET_NULL, null=True, blank=True, related_name="source_orders"
+    )
 
     # Tax/discount inputs — see finance/tax.py for the shared calculation.
     discount_type = models.CharField(max_length=16, choices=DiscountType.choices, default=DiscountType.NONE)

@@ -12,6 +12,7 @@ from .views import (
     InvoiceViewSet,
     PaymentViewSet,
     RecurringTransactionViewSet,
+    RefundViewSet,
 )
 
 app_name = "finance"
@@ -31,6 +32,10 @@ invoice_record_payment = InvoiceViewSet.as_view({"post": "record_payment"})
 
 payment_list = PaymentViewSet.as_view({"get": "list"})
 payment_detail = PaymentViewSet.as_view({"get": "retrieve"})
+payment_refund = PaymentViewSet.as_view({"post": "refund"})
+
+refund_list = RefundViewSet.as_view({"get": "list"})
+refund_detail = RefundViewSet.as_view({"get": "retrieve"})
 
 estimate_list = EstimateViewSet.as_view({"get": "list", "post": "create"})
 estimate_detail = EstimateViewSet.as_view(
@@ -79,6 +84,9 @@ urlpatterns = [
     ),
     path("businesses/<uuid:business_id>/payments/", payment_list, name="payment-list"),
     path("businesses/<uuid:business_id>/payments/<uuid:pk>/", payment_detail, name="payment-detail"),
+    path("businesses/<uuid:business_id>/payments/<uuid:pk>/refund/", payment_refund, name="payment-refund"),
+    path("businesses/<uuid:business_id>/refunds/", refund_list, name="refund-list"),
+    path("businesses/<uuid:business_id>/refunds/<uuid:pk>/", refund_detail, name="refund-detail"),
     path("businesses/<uuid:business_id>/estimates/", estimate_list, name="estimate-list"),
     path("businesses/<uuid:business_id>/estimates/<uuid:pk>/", estimate_detail, name="estimate-detail"),
     path(

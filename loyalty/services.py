@@ -16,6 +16,7 @@ from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from core.email import send_email
+from finance import services as finance_services
 from finance.tax import TaxLineItem, calculate_totals
 
 from .models import (
@@ -34,6 +35,10 @@ class LoyaltyError(Exception):
 
 
 class InvalidOrderStateError(LoyaltyError):
+    pass
+
+
+class OrderAlreadyConvertedError(LoyaltyError):
     pass
 
 
@@ -282,6 +287,58 @@ def cancel_order(order: Order) -> Order:
         locked_order.status = Order.Status.CANCELLED
         locked_order.save(update_fields=["status", "updated_at"])
         return locked_order
+
+
+def convert_order_to_invoice(order: Order, due_date=None):
+    """
+    Decision: an Order can exist on its own (POS-style instant sale) or
+    later be converted into a billed Invoice — mirrors
+    finance.services.convert_estimate_to_invoice exactly (same
+    select_for_update-then-recheck double-guard against double conversion,
+    same reuse of finance.services.create_invoice rather than
+    reimplementing invoice creation).
+
+    Once converted, Order and Invoice are independent: cancelling the
+    Order (services.cancel_order) only ever reverses the points it
+    awarded — it never touches the linked Invoice's status. The Invoice
+    has its own state machine and its own rules (e.g. a paid invoice
+    can't be cancelled via finance.services.cancel_invoice either); an
+    Order being cancelled after conversion doesn't retroactively make the
+    Invoice's billing obligation go away, and silently cancelling a
+    possibly-already-paid Invoice out from under the customer would be
+    far more surprising than leaving the two independent once linked.
+    The link (order.invoice) stays in place either way, for traceability.
+    """
+    if order.status == Order.Status.CANCELLED:
+        raise InvalidOrderStateError("Cannot convert a cancelled order to an invoice.")
+    if order.invoice_id is not None:
+        raise OrderAlreadyConvertedError("Order has already been converted to an invoice.")
+
+    with transaction.atomic():
+        locked_order = Order.objects.select_for_update().get(pk=order.pk)
+        if locked_order.status == Order.Status.CANCELLED:
+            raise InvalidOrderStateError("Cannot convert a cancelled order to an invoice.")
+        if locked_order.invoice_id is not None:
+            raise OrderAlreadyConvertedError("Order has already been converted to an invoice.")
+
+        line_items_data = [
+            {"description": li.description, "quantity": li.quantity, "unit_price": li.unit_price}
+            for li in locked_order.line_items.all()
+        ]
+        invoice = finance_services.create_invoice(
+            business=locked_order.business,
+            customer=locked_order.customer,
+            line_items_data=line_items_data,
+            tax_type=locked_order.tax_type,
+            discount_type=locked_order.discount_type,
+            discount_value=locked_order.discount_value,
+            due_date=due_date,
+            notes=f"Converted from Order {locked_order.id}",
+        )
+
+        locked_order.invoice = invoice
+        locked_order.save(update_fields=["invoice", "updated_at"])
+        return invoice
 
 
 # --- Gift cards --------------------------------------------------------------------
